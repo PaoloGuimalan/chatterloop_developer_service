@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -34,35 +35,46 @@ type Conversation struct {
 	ParticipantIDs   []string
 }
 
-// LoadConversation fetches a conversation and asserts the entity is in it.
-func LoadConversation(ctx context.Context, db *mongo.Database, conversationID, entityID string) (*Conversation, error) {
+// LoadConversation fetches a conversation and asserts the entity may read it.
+//
+// Access is decided by AssertMember - the SAME rule the send path uses - and
+// deliberately NOT by the conversation's participant_ids alone. Those two
+// disagree in a case that is completely ordinary: in a realm conversation
+// membership lives in community_member, and participant_ids is only refreshed
+// when SaveConversation next runs. A member added since the last message is
+// therefore absent from the array while being unambiguously a member.
+//
+// Checking participant_ids here meant an entity could SEND to a conversation
+// it could not READ, which for a bot is the worst possible half: it answers a
+// mention by first fetching history, so a 404 there makes it silently never
+// reply.
+func LoadConversation(
+	ctx context.Context,
+	db *mongo.Database,
+	pool *pgxpool.Pool,
+	conversationID, entityID string,
+) (*Conversation, error) {
+	if err := AssertMember(ctx, db, pool, conversationID, entityID); err != nil {
+		if errors.Is(err, ErrNoAccess) {
+			return nil, ErrNotAParticipant
+		}
+		return nil, err
+	}
+
 	var raw bson.M
 	err := db.Collection("conversations").
 		FindOne(ctx, bson.M{"conversationID": conversationID}).
 		Decode(&raw)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return nil, ErrNotAParticipant
+			// Membership held but no conversation document yet - a realm whose
+			// chat has never been written to. An empty transcript, not a 404.
+			return &Conversation{ConversationID: conversationID, ConversationType: "group"}, nil
 		}
 		return nil, err
 	}
 
 	participants := stringSlice(raw["participant_ids"])
-	found := false
-	for _, participant := range participants {
-		if participant == entityID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		// THE load-bearing check. messages.read says this entity may read
-		// conversations; it does not say which. Without this, any token with
-		// the scope could walk the collection by id and read every private
-		// chat on the platform.
-		return nil, ErrNotAParticipant
-	}
-
 	conversationType, _ := raw["conversationType"].(string)
 	if conversationType == "" {
 		conversationType = "single"

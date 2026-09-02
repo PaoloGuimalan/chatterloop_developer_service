@@ -118,7 +118,7 @@ func (h *Handlers) ConversationMessages(w http.ResponseWriter, r *http.Request) 
 	conversationID := r.PathValue("conversationID")
 	limit := readLimit(r, 50, 200)
 
-	conversation, err := platform.LoadConversation(r.Context(), h.Conns.Mongo, conversationID, token.EntityID)
+	conversation, err := platform.LoadConversation(r.Context(), h.Conns.Mongo, h.Conns.Postgres, conversationID, token.EntityID)
 	if err != nil {
 		if errors.Is(err, platform.ErrNotAParticipant) {
 			// 404 rather than 403: a caller who is not a participant should

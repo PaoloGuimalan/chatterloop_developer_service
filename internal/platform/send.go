@@ -102,7 +102,17 @@ func SendMessage(ctx context.Context, deps Deps, senderEntityID string, req Send
 		return nil, err
 	}
 
-	conversationType := normalizeConversationType(req.ConversationType)
+	// The caller's conversationType is a FALLBACK, never authoritative.
+	//
+	// A message must not be able to re-type the conversation it is sent to.
+	// The RAG bot exposed this the hard way: its responder defaults to
+	// "single", so one reply into a real group silently rewrote that
+	// conversation's type and the UI started rendering a group as a DM.
+	//
+	// Order of truth: what the conversation already says, then the realm it
+	// belongs to, then - only for a genuinely new, non-realm conversation -
+	// whatever the caller claimed.
+	conversationType := resolveConversationType(ctx, deps, req.ConversationID, req.ConversationType)
 	messageType := req.MessageType
 	if messageType == "" {
 		messageType = "text"
@@ -347,7 +357,6 @@ func saveConversation(
 	now time.Time,
 ) error {
 	set := bson.M{
-		"conversationType": conversationType,
 		"last_message": bson.M{
 			"messageID":   messageID,
 			"sender":      sender,
@@ -363,7 +372,12 @@ func saveConversation(
 
 	_, err := db.Collection("conversations").UpdateOne(ctx,
 		bson.M{"conversationID": conversationID},
-		bson.M{"$set": set, "$setOnInsert": bson.M{"conversationID": conversationID}},
+		// conversationType goes in $setOnInsert, never $set: an existing
+		// conversation keeps the type it already has, so no send can change it.
+		bson.M{"$set": set, "$setOnInsert": bson.M{
+			"conversationID":   conversationID,
+			"conversationType": conversationType,
+		}},
 		options.Update().SetUpsert(true),
 	)
 	return err
@@ -407,6 +421,30 @@ func randomDigits(length int) (string, error) {
 		out.WriteByte(byte('0' + n.Int64()))
 	}
 	return out.String(), nil
+}
+
+// resolveConversationType decides a conversation's type from the most
+// authoritative source available, ignoring the caller wherever one exists.
+func resolveConversationType(ctx context.Context, deps Deps, conversationID, claimed string) string {
+	var existing bson.M
+	if err := deps.Mongo.Collection("conversations").
+		FindOne(ctx, bson.M{"conversationID": conversationID}).
+		Decode(&existing); err == nil {
+		if stored, _ := existing["conversationType"].(string); stored != "" {
+			return stored
+		}
+	}
+
+	// A conversation id that matches a realm IS that realm; its type is the
+	// realm's, whatever the caller believes.
+	var realmType string
+	if err := deps.Postgres.QueryRow(ctx,
+		`SELECT type FROM community_realm WHERE realm_id = $1`, conversationID,
+	).Scan(&realmType); err == nil && realmType != "" {
+		return normalizeConversationType(realmType)
+	}
+
+	return normalizeConversationType(claimed)
 }
 
 // normalizeConversationType mirrors the platform's: "server" is stored as
