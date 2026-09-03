@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.exe
+*.exe~
+developer_service
+bin/
+README.md
+API.md

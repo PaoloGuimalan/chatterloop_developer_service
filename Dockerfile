@@ -1,23 +1,31 @@
-# Build
+# syntax=docker/dockerfile:1
+
 FROM golang:1.26-alpine AS build
+
 WORKDIR /src
 
-# Dependencies first, so a source-only change does not re-download the module
-# graph on every build.
+# Manifests first, so the dependency layer caches independently of source edits
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-# Static binary: the runtime stage has no libc to link against.
+
+# CGO_ENABLED=0 yields a static binary that runs on a distroless base.
+# -s -w strips debug info and symbol tables to shrink it.
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/developer_service ./cmd/developer
 
-# Runtime
-FROM alpine:3.20
-# Certificates are needed: Mongo Atlas and a hosted Redis are both TLS.
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 developer
-USER developer
+# static-debian12 ships ca-certificates, which the Supabase, Mongo Atlas and
+# hosted Redis TLS connections all need
+FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=build /out/developer_service /usr/local/bin/developer_service
+WORKDIR /app
+COPY --from=build /out/developer_service /app/developer_service
+
+# No secure-connect bundle here, unlike worker_service: this service does not
+# talk to Cassandra. See the package docs in internal/connections - Postgres,
+# Mongo and Redis are the whole dependency list, deliberately.
 
 EXPOSE 8890
-ENTRYPOINT ["/usr/local/bin/developer_service"]
+USER nonroot:nonroot
+
+ENTRYPOINT ["/app/developer_service"]
