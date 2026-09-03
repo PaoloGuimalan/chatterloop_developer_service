@@ -56,6 +56,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -73,6 +74,7 @@ const (
 	PermissionMessagesRead      = "messages.read"
 	PermissionNotificationsRead = "notifications.read"
 	PermissionMessagesSend      = "messages.send"
+	PermissionCommentsCreate    = "comments.create"
 )
 
 // Every entry must be a GLOBAL-scoped codename in the platform catalog. A
@@ -83,6 +85,7 @@ var gatedPermissions = map[string]bool{
 	PermissionMessagesRead:      true,
 	PermissionNotificationsRead: true,
 	PermissionMessagesSend:      true,
+	PermissionCommentsCreate:    true,
 }
 
 var (
@@ -95,6 +98,18 @@ var (
 	// ErrUnknownPermission means Authorize was asked about something outside
 	// gatedPermissions. A programming error, not a client error.
 	ErrUnknownPermission = errors.New("permission is not one this service may decide")
+
+	// ErrBackendUnavailable means the credential could not be CHECKED - the
+	// database refused the query - as opposed to being checked and found
+	// wanting.
+	//
+	// These used to be the same error, on the reasoning that a client should
+	// learn nothing either way. That is right about the RESPONSE and wrong
+	// about the LOGS: a pooler fault made every request fail with "Invalid or
+	// expired token", and the only visible evidence pointed at the token. An
+	// operator has to be able to tell "your credential is bad" from "this
+	// service cannot reach its database", even when the caller cannot.
+	ErrBackendUnavailable = errors.New("token store is unavailable")
 )
 
 // Token is a live credential row.
@@ -175,9 +190,15 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 	).Scan(&id, &entityID, &realmID, &name, &tokenHash, &scopesRaw,
 		&isActive, &revokedAt, &expiresAt)
 	if err != nil {
-		// A miss and a database error are both "cannot authenticate". The
-		// error is logged by the caller; the client learns nothing either way.
-		return nil, ErrInvalidToken
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No such prefix. An unknown token and a revoked one are
+			// deliberately indistinguishable to the caller.
+			return nil, ErrInvalidToken
+		}
+		// The credential could not be CHECKED. Distinguished so the caller can
+		// log it and answer 503 rather than telling a client with a perfectly
+		// good token that it is expired.
+		return nil, fmt.Errorf("%w: %w", ErrBackendUnavailable, err)
 	}
 
 	// Constant time: an early-exit comparison would let an attacker holding a

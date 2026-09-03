@@ -27,6 +27,11 @@ import (
 const (
 	SendPush      = "send_push"
 	BumpChatScore = "bump_chat_score"
+	// Both published by Django's CommentsView.post(); reproduced when a
+	// comment is created through this API so a bot's comment moves the same
+	// counters a person's does.
+	UpdateRankingScore   = "update_ranking_score"
+	BumpInterestAffinity = "bump_interest_affinity"
 )
 
 // PushPayload mirrors worker_service's rabbitmq.SendPushPayload exactly. The
@@ -56,6 +61,29 @@ type ChatScorePayload struct {
 	MemberIDs  []string `json:"member_ids"`
 	Action     string   `json:"action"`
 	IsDecrease bool     `json:"is_decrease"`
+}
+
+// RankingPayload mirrors worker_service's UpdateRankingPayload. The worker
+// owns comments_count the same way it owns likes_count, so a comment written
+// here must publish this or the count never moves.
+type RankingPayload struct {
+	PostID     string `json:"post_id"`
+	UpdateType string `json:"update_type"`
+	IsDecrease bool   `json:"is_decrease"`
+}
+
+// InterestAffinityPayload mirrors worker_service's BumpInterestAffinityPayload.
+//
+// InterestIDs are int64 and not strings, because interests_interest.id is a
+// bigint - Django's publishers put JSON numbers on the wire. The worker's own
+// comment records what a []string declaration cost the last time somebody got
+// this wrong: the payload failed to unmarshal, the listener consumes with
+// autoAck, and every bump silently vanished.
+type InterestAffinityPayload struct {
+	EntityID    string  `json:"entity_id"`
+	InterestIDs []int64 `json:"interest_ids"`
+	Action      string  `json:"action"`
+	IsDecrease  bool    `json:"is_decrease"`
 }
 
 type Publisher struct {

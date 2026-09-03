@@ -27,6 +27,20 @@ type Message struct {
 	IsReply        bool   `json:"is_reply"`
 	ReplyingTo     string `json:"replying_to"`
 	SenderHandle   string `json:"sender_handle"`
+
+	// WHO WROTE THE MESSAGE THIS ONE REPLIES TO.
+	//
+	// Empty unless IsReply and the parent is still readable. Resolved here
+	// rather than by the client because the parent is frequently OUTSIDE the
+	// window a client asked for - a follow-up an hour later replies to a
+	// message forty turns back - so a consumer computing it from the returned
+	// slice would get "unknown" exactly when the answer matters.
+	//
+	// This is what lets a bot answer a reply that does not @-mention it: the
+	// whole question is whether the parent's author is the caller, and that is
+	// one field comparison instead of a second fetch and a guess.
+	ReplyingToSenderEntityID string `json:"replying_to_sender_entity_id"`
+	ReplyingToSenderHandle   string `json:"replying_to_sender_handle"`
 }
 
 type Conversation struct {
@@ -86,20 +100,129 @@ func LoadConversation(
 	}, nil
 }
 
+// messageProjection is shared by every message read below, so a field added
+// for one caller cannot be quietly missing for another.
+var messageProjection = bson.M{
+	"_id": 0, "messageID": 1, "conversationID": 1, "sender": 1,
+	"content": 1, "messageDate": 1, "messageType": 1,
+	"isReply": 1, "replyingTo": 1,
+}
+
 // RecentMessages returns the newest `limit` messages, OLDEST FIRST so the slice
 // reads as a transcript.
 func RecentMessages(ctx context.Context, db *mongo.Database, conversationID string, limit int64) ([]Message, error) {
-	cursor, err := db.Collection("messages").Find(ctx,
+	messages, err := findMessages(ctx, db, conversationID,
 		bson.M{
 			"conversationID": conversationID,
 			"isDeleted":      bson.M{"$ne": true},
-		},
+		}, limit)
+	if err != nil {
+		return nil, err
+	}
+	if err := resolveReplyParents(ctx, db, messages); err != nil {
+		// Enrichment, not content: a transcript missing the authorship of a
+		// reply's parent is still a complete transcript, and failing the whole
+		// read over it would take the history path down with it.
+		return messages, nil
+	}
+	return messages, nil
+}
+
+// RepliesTo returns the recent messages in a conversation that reply to a
+// message `entityID` WROTE.
+//
+// # WHY THIS IS A ROUTE AND NOT A CLIENT-SIDE FILTER
+//
+// The realtime frame for a new message carries the conversation, the sender,
+// and a per-recipient `mentioner` - and nothing else. No message id and no
+// `replyingTo`. So a client asking "did that message reply to me?" has one
+// honest move: read. Doing it as a history fetch costs a full window on EVERY
+// message in EVERY conversation the entity belongs to, which is the difference
+// between a bot that scales and one that does not.
+//
+// Answered here it is two indexed lookups and a usually-empty result. The
+// "authored by me" half is decided from the token's entity, so there is no
+// version of this a caller can point at somebody else's messages.
+//
+// # THE WINDOW
+//
+// `limit` bounds the REPLIES scanned, not the conversation. A busy channel
+// where nobody has replied to this entity returns an empty slice having read
+// one indexed page, which is the case this route exists to make cheap.
+func RepliesTo(
+	ctx context.Context,
+	db *mongo.Database,
+	conversationID, entityID string,
+	limit int64,
+) ([]Message, error) {
+	if entityID == "" {
+		return []Message{}, nil
+	}
+
+	candidates, err := findMessages(ctx, db, conversationID,
+		bson.M{
+			"conversationID": conversationID,
+			"isDeleted":      bson.M{"$ne": true},
+			"isReply":        true,
+		}, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return []Message{}, nil
+	}
+
+	parentIDs := make([]string, 0, len(candidates))
+	for _, message := range candidates {
+		if message.ReplyingTo != "" {
+			parentIDs = append(parentIDs, message.ReplyingTo)
+		}
+	}
+	own, err := messagesAuthoredBy(ctx, db, parentIDs, entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	replies := selectRepliesTo(candidates, own)
+	for i := range replies {
+		// Known by construction: a parent is in `own` precisely because its
+		// sender is this entity. Filled in so a row from here has the same
+		// shape as one from RecentMessages.
+		replies[i].ReplyingToSenderEntityID = entityID
+	}
+	return replies, nil
+}
+
+// selectRepliesTo keeps the messages whose parent is in `ownParentIDs`,
+// preserving order.
+//
+// Split out from RepliesTo because it IS the rule - a reply counts only when
+// the message it replies to is mine - and a rule that decides whether a bot
+// speaks unprompted deserves to be testable without a database.
+func selectRepliesTo(messages []Message, ownParentIDs map[string]bool) []Message {
+	kept := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		if message.ReplyingTo == "" || !ownParentIDs[message.ReplyingTo] {
+			continue
+		}
+		kept = append(kept, message)
+	}
+	return kept
+}
+
+// findMessages runs one newest-first query and returns it OLDEST FIRST, so
+// every caller gets a slice that reads as a transcript while the limit still
+// takes the latest window.
+func findMessages(
+	ctx context.Context,
+	db *mongo.Database,
+	conversationID string,
+	filter bson.M,
+	limit int64,
+) ([]Message, error) {
+	cursor, err := db.Collection("messages").Find(ctx, filter,
 		options.Find().
-			SetProjection(bson.M{
-				"_id": 0, "messageID": 1, "conversationID": 1, "sender": 1,
-				"content": 1, "messageDate": 1, "messageType": 1,
-				"isReply": 1, "replyingTo": 1,
-			}).
+			SetProjection(messageProjection).
 			// Newest first so the limit takes the LATEST window; reversed below.
 			SetSort(bson.D{{Key: "messageDate", Value: -1}, {Key: "_id", Value: -1}}).
 			SetLimit(limit),
@@ -116,39 +239,137 @@ func RecentMessages(ctx context.Context, db *mongo.Database, conversationID stri
 
 	messages := make([]Message, 0, len(raws))
 	for i := len(raws) - 1; i >= 0; i-- {
-		raw := raws[i]
-		messageID, _ := raw["messageID"].(string)
-		sender, _ := raw["sender"].(string)
-		content, isText := raw["content"].(string)
-		if messageID == "" || sender == "" {
-			// No id means nothing to thread a reply under; no sender means a
-			// consumer's own loop guard cannot run.
+		message, ok := decodeMessage(raws[i], conversationID)
+		if !ok {
 			continue
 		}
-		if !isText {
-			// Image and file messages store non-text content. Real messages,
-			// but nothing to read or embed.
-			continue
-		}
-		messageType, _ := raw["messageType"].(string)
-		if messageType == "" {
-			messageType = "text"
-		}
-		isReply, _ := raw["isReply"].(bool)
-		replyingTo, _ := raw["replyingTo"].(string)
-
-		messages = append(messages, Message{
-			MessageID:      messageID,
-			ConversationID: conversationID,
-			SenderEntityID: sender,
-			Content:        content,
-			CreatedAt:      ToEpochMillis(raw["messageDate"]),
-			MessageType:    messageType,
-			IsReply:        isReply,
-			ReplyingTo:     replyingTo,
-		})
+		messages = append(messages, message)
 	}
 	return messages, nil
+}
+
+// decodeMessage narrows one stored row, reporting whether it is usable.
+func decodeMessage(raw bson.M, conversationID string) (Message, bool) {
+	messageID, _ := raw["messageID"].(string)
+	sender, _ := raw["sender"].(string)
+	content, isText := raw["content"].(string)
+	if messageID == "" || sender == "" {
+		// No id means nothing to thread a reply under; no sender means a
+		// consumer's own loop guard cannot run.
+		return Message{}, false
+	}
+	if !isText {
+		// Image and file messages store non-text content. Real messages, but
+		// nothing to read or embed.
+		return Message{}, false
+	}
+	messageType, _ := raw["messageType"].(string)
+	if messageType == "" {
+		messageType = "text"
+	}
+	isReply, _ := raw["isReply"].(bool)
+	replyingTo, _ := raw["replyingTo"].(string)
+	if stored, _ := raw["conversationID"].(string); stored != "" {
+		conversationID = stored
+	}
+
+	return Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderEntityID: sender,
+		Content:        content,
+		CreatedAt:      ToEpochMillis(raw["messageDate"]),
+		MessageType:    messageType,
+		IsReply:        isReply,
+		ReplyingTo:     replyingTo,
+	}, true
+}
+
+// resolveReplyParents fills ReplyingToSenderEntityID for every reply in the
+// slice, in ONE lookup for the whole batch.
+//
+// Parents are looked up by id and NOT restricted to the conversation: a
+// `replyingTo` always points inside its own conversation, so adding that
+// filter would only mask a data bug by blanking the field instead.
+func resolveReplyParents(ctx context.Context, db *mongo.Database, messages []Message) error {
+	parentIDs := make([]string, 0, len(messages))
+	for _, message := range messages {
+		if message.ReplyingTo != "" {
+			parentIDs = append(parentIDs, message.ReplyingTo)
+		}
+	}
+	unique := dedupe(parentIDs)
+	if len(unique) == 0 {
+		return nil
+	}
+
+	cursor, err := db.Collection("messages").Find(ctx,
+		bson.M{"messageID": bson.M{"$in": unique}},
+		options.Find().SetProjection(bson.M{"_id": 0, "messageID": 1, "sender": 1}),
+	)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	var raws []bson.M
+	if err := cursor.All(ctx, &raws); err != nil {
+		return err
+	}
+
+	senders := make(map[string]string, len(raws))
+	for _, raw := range raws {
+		messageID, _ := raw["messageID"].(string)
+		sender, _ := raw["sender"].(string)
+		if messageID != "" && sender != "" {
+			senders[messageID] = sender
+		}
+	}
+	for i := range messages {
+		// A deleted or purged parent leaves this empty rather than guessed at.
+		messages[i].ReplyingToSenderEntityID = senders[messages[i].ReplyingTo]
+	}
+	return nil
+}
+
+// messagesAuthoredBy returns which of `messageIDs` were written by `entityID`.
+//
+// The authorship filter is in the QUERY, not applied to the result. This set
+// is the only thing between "somebody replied to me" and "somebody replied to
+// anybody", so it should not be possible to read a row out of it that belongs
+// to someone else.
+func messagesAuthoredBy(
+	ctx context.Context,
+	db *mongo.Database,
+	messageIDs []string,
+	entityID string,
+) (map[string]bool, error) {
+	unique := dedupe(messageIDs)
+	if len(unique) == 0 {
+		return map[string]bool{}, nil
+	}
+
+	cursor, err := db.Collection("messages").Find(ctx,
+		bson.M{"messageID": bson.M{"$in": unique}, "sender": entityID},
+		options.Find().SetProjection(bson.M{"_id": 0, "messageID": 1}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var raws []bson.M
+	if err := cursor.All(ctx, &raws); err != nil {
+		return nil, err
+	}
+
+	own := make(map[string]bool, len(raws))
+	for _, raw := range raws {
+		if messageID, _ := raw["messageID"].(string); messageID != "" {
+			own[messageID] = true
+		}
+	}
+	return own, nil
 }
 
 // ToEpochMillis normalises a messageDate.

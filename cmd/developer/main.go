@@ -69,12 +69,35 @@ func main() {
 		auth.Middleware(conns.Postgres,
 			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
 				http.HandlerFunc(handlers.ConversationMessages))))
+	// "Which recent messages here reply to something I wrote." Same scope as
+	// reading the conversation, because that is what it is - a filtered read of
+	// the same messages, answered server-side so a client does not have to pull
+	// the whole window to find out.
+	mux.Handle("GET /v1/conversations/{conversationID}/replies",
+		auth.Middleware(conns.Postgres,
+			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
+				http.HandlerFunc(handlers.ConversationReplies))))
 	mux.Handle("GET /v1/mentions/comments", auth.Middleware(conns.Postgres,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.CommentMentions))))
+	mux.Handle("GET /v1/comments/replies", auth.Middleware(conns.Postgres,
+		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
+			http.HandlerFunc(handlers.CommentReplies))))
+	// Gated on notifications.read because that is the scope a consumer holds
+	// to LEARN a comment concerns it, and this is the follow-on read for
+	// exactly that. The platform catalog has no comment-read codename to use
+	// instead, and inventing one here would mean a Django migration before
+	// this service could gate anything on it. Move it if the catalog gains
+	// `comments.read`.
+	mux.Handle("GET /v1/posts/{postID}/comments", auth.Middleware(conns.Postgres,
+		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
+			http.HandlerFunc(handlers.PostComments))))
 	mux.Handle("POST /v1/messages/send", auth.Middleware(conns.Postgres,
 		auth.RequireScope(conns.Postgres, auth.PermissionMessagesSend,
 			http.HandlerFunc(handlers.SendMessage))))
+	mux.Handle("POST /v1/comments", auth.Middleware(conns.Postgres,
+		auth.RequireScope(conns.Postgres, auth.PermissionCommentsCreate,
+			http.HandlerFunc(handlers.CreateComment))))
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,

@@ -91,6 +91,10 @@ func TestGatedPermissionsAreTheOnesWeDocument(t *testing.T) {
 		PermissionMessagesRead:      true,
 		PermissionNotificationsRead: true,
 		PermissionMessagesSend:      true,
+		// Added with POST /v1/comments. Confirmed against
+		// entity/permissions.py: COMMENTS_CREATE is in GLOBAL_SCOPED, so it
+		// resolves without the role matrix this service does not carry.
+		PermissionCommentsCreate: true,
 	}
 	if len(gatedPermissions) != len(want) {
 		t.Fatalf("gatedPermissions has %d entries, expected %d - if you added one, "+

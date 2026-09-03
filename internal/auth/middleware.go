@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -36,6 +37,16 @@ func Middleware(pool *pgxpool.Pool, next http.Handler) http.Handler {
 
 		token, err := Verify(r.Context(), pool, parts[1])
 		if err != nil {
+			if errors.Is(err, ErrBackendUnavailable) {
+				// NOT a 401. The credential was never judged, and saying
+				// "invalid or expired token" about a token nothing looked at
+				// sends whoever is debugging it to rotate a perfectly good
+				// credential - which is exactly what happened.
+				slog.Error("token store unavailable", "error", err)
+				writeError(w, http.StatusServiceUnavailable,
+					"Could not verify the token right now.")
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "Invalid or expired token.")
 			return
 		}
