@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -268,6 +269,8 @@ func fanOut(
 		body = "Sent an attachment"
 	}
 
+	senderName := "@" + senderHandle // matches push_payload.dart's own example: "senderName": "@paulo"
+
 	if len(plain) > 0 {
 		deps.Queue.Publish(ctx, queue.SendPush, queue.PushPayload{
 			EntityIDs: plain,
@@ -275,27 +278,85 @@ func fanOut(
 			Title:     title,
 			Body:      body,
 			Tag:       req.ConversationID,
-			Data: map[string]string{
-				"type": "message", "conversationId": req.ConversationID,
-				"senderId": senderEntityID, "messageId": messageID,
-			},
+			Data: messagePushData(
+				req.ConversationID, realmName, senderEntityID, senderName,
+				body, messageID, conversationType, now,
+			),
 		})
 	}
 	if len(mentionTargets) > 0 {
+		mentionBody := senderName + " mentioned you: " + body
 		deps.Queue.Publish(ctx, queue.SendPush, queue.PushPayload{
 			EntityIDs: mentionTargets,
 			// The quieter Activity channel, whose tone is the sound the
 			// webapp already plays for a mention.
 			Channel: queue.ChannelActivity,
 			Title:   title,
-			Body:    "@" + senderHandle + " mentioned you: " + body,
+			Body:    mentionBody,
 			Tag:     req.ConversationID,
-			Data: map[string]string{
-				"type": "mention", "conversationId": req.ConversationID,
-				"senderId": senderEntityID, "messageId": messageID,
-				"route": "/conversation/" + req.ConversationID,
-			},
+			Data: mentionPushData(
+				req.ConversationID, senderEntityID, title, mentionBody, messageID,
+			),
 		})
+	}
+}
+
+// messagePushData is what chatterloop_app's push_payload.dart actually reads
+// for a "message"-type push.
+//
+// Everything the tray renders comes from `data`, never from the queue.
+// PushPayload.Title/Body fields above - see push_payload.dart's own header:
+// "deliberately NOT from `notification`", because a data-only message is what
+// lets the app build its own threaded, per-sender MessagingStyle layout
+// instead of the OS's flat title+body. Title/Body are still sent (Android/
+// APNs require SOME top-level content on a push), but the renderer never
+// reads them for a "message" type - only `data` does, via the fallback chain
+// `senderName ?? conversationName ?? title`. Before this existed, `data`
+// carried none of these fields, so every message sent through this endpoint -
+// currently only the chatterloop bot - rendered as an empty notification
+// tray-side, even though the OS-level Title/Body were always correct. Node's
+// own pushnotification.js sendMessage() sends this same field set; this now
+// matches it field-for-field.
+//
+// Pure and dependency-free on purpose, unlike fanOut itself (Mongo/Postgres/
+// Redis/Queue via Deps) - this is the part a regression would actually land
+// in, and the part cheap enough to hold a real test without mocking any of
+// those.
+func messagePushData(
+	conversationID, conversationName, senderEntityID, senderName,
+	body, messageID, conversationType string, sentAt time.Time,
+) map[string]string {
+	return map[string]string{
+		"type":             "message",
+		"conversationId":   conversationID,
+		"conversationName": conversationName,
+		"isGroup":          strconv.FormatBool(conversationType != "single"),
+		"senderId":         senderEntityID,
+		"senderName":       senderName,
+		"body":             body,
+		"sentAt":           strconv.FormatInt(sentAt.UnixMilli(), 10),
+		"messageId":        messageID,
+	}
+}
+
+// mentionPushData is what push_payload.dart reads for anything OTHER than
+// "message" - the generic title+body path ("the second shape" in its header
+// comment). That is why this needs data.title/data.body directly, rather
+// than the "message" type's senderName/conversationName fallback chain.
+//
+// Takes the already-composed body rather than building "@x mentioned you: "
+// itself, so that text can never drift from what the top-level
+// queue.PushPayload.Body (which some future path might still read) says -
+// one string, read twice, not built twice.
+func mentionPushData(conversationID, senderEntityID, title, body, messageID string) map[string]string {
+	return map[string]string{
+		"type":           "mention",
+		"conversationId": conversationID,
+		"title":          title,
+		"body":           body,
+		"senderId":       senderEntityID,
+		"messageId":      messageID,
+		"route":          "/conversation/" + conversationID,
 	}
 }
 
