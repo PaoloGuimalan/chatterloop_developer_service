@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,12 +22,18 @@ func FromContext(ctx context.Context) (*Token, bool) {
 	return token, ok
 }
 
-// Middleware authenticates `Authorization: Bearer clt_...`.
+// Middleware authenticates `Authorization: Bearer clt_...` and enforces the
+// token's own rate limit.
 //
 // Deliberately NOT x-access-token, which is the user session's header on the
 // Django and Node surfaces. A credential that cannot be presented on the wrong
 // door cannot be accepted by it by mistake.
-func Middleware(pool *pgxpool.Pool, next http.Handler) http.Handler {
+//
+// limiter is nil-able: a nil limiter (nothing wired up, e.g. some future test
+// harness with no Redis) skips the check entirely rather than panicking -
+// every real deployment wires one, since main.go always has conns.Redis by
+// the time it builds the mux.
+func Middleware(pool *pgxpool.Pool, limiter RateLimitStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := r.Header.Get("Authorization")
 		parts := strings.Fields(header)
@@ -54,6 +61,26 @@ func Middleware(pool *pgxpool.Pool, next http.Handler) http.Handler {
 		// Best-effort telemetry; never fail a request over it.
 		if err := TouchLastUsed(r.Context(), pool, token.ID); err != nil {
 			slog.Warn("last_used_at update failed", "token_id", token.ID, "error", err)
+		}
+
+		if limiter != nil {
+			allowed, retryAfter, err := CheckRateLimit(r.Context(), limiter, token)
+			if err != nil {
+				// Same call as ErrBackendUnavailable above: the limit was
+				// never CHECKED, so this must not read as the limit being
+				// exceeded. A client that got 429 here would be told to slow
+				// down for a Redis hiccup that had nothing to do with it.
+				slog.Error("rate limit check failed", "token_id", token.ID, "error", err)
+				writeError(w, http.StatusServiceUnavailable,
+					"Could not verify the rate limit right now.")
+				return
+			}
+			if !allowed {
+				w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+				writeError(w, http.StatusTooManyRequests,
+					"This token has exceeded its rate limit.")
+				return
+			}
 		}
 
 		ctx := context.WithValue(r.Context(), tokenKey, token)

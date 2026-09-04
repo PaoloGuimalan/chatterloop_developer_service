@@ -101,17 +101,32 @@ entity that will own it.
 INSERT INTO entity_token
   (id, entity_id, name, description, prefix, token_hash, scopes,
    realm_id, created_by_id, created_at, expires_at, last_used_at,
-   revoked_at, is_active)
+   revoked_at, is_active, rate_limit_int, rate_limit_type)
 VALUES
   ('<id>', '<entity-id>', 'rag pipeline (prod)', '',
    '<prefix>', '<hash>',
    '["messages.read","notifications.read","messages.send","comments.create","events.subscribe"]'::jsonb,
-   NULL, NULL, NOW(), NOW() + INTERVAL '90 days', NULL, NULL, true);
+   NULL, NULL, NOW(), NOW() + INTERVAL '90 days', NULL, NULL, true, NULL, NULL);
 ```
 
 `scopes` is a JSON array of catalog codenames. `expires_at` may be `NULL` for
 no expiry — a service credential that never expires should be a decision, not
 a default.
+
+`rate_limit_int` / `rate_limit_type` are a pair: both `NULL` (the default for
+every existing token) means unlimited; set both together to cap how many
+requests *this one credential* may make per window, independent of every
+other token the same entity holds. `rate_limit_type` is one of `second`,
+`minute`, `hour`, `day`, `week`, `month`, `year` — e.g. `(100000, 'month')`
+for a subscription tier, `(5, 'second')` for an internal service. Setting one
+without the other is rejected by `Token.clean()` on the Django side.
+
+Enforced by this service (`internal/auth/ratelimit.go`) against Redis, on
+every authenticated route — a token over its limit gets
+`429 Too Many Requests` with a `Retry-After` header, before the request
+reaches its handler. `month`/`year` windows reset on the UTC calendar
+boundary (the 1st of the month/January), not on a fixed 30- or 365-day
+timer.
 
 **3 — grant the same capabilities to the entity.** Without these the token is
 issued but inert, because authorization is an intersection.

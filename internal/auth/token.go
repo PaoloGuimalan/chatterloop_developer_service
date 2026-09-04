@@ -119,6 +119,13 @@ type Token struct {
 	RealmID  *string
 	Name     string
 	Scopes   []string
+	// Requests this token may make per RateLimitType (a RateLimitPeriod
+	// value: "second".."year"). Both nil means unlimited; set together or
+	// left blank together (entity/models.py Token.clean() enforces the
+	// pairing at write time - this side only reads it). See CheckRateLimit
+	// (ratelimit.go), the only thing that reads either field.
+	RateLimitInt  *int
+	RateLimitType *string
 }
 
 // HasScope reports whether the token carries a codename. Half an authorization
@@ -171,24 +178,27 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 	}
 
 	var (
-		id        string
-		entityID  string
-		realmID   *string
-		name      string
-		tokenHash string
-		scopesRaw []byte
-		isActive  bool
-		revokedAt *time.Time
-		expiresAt *time.Time
+		id            string
+		entityID      string
+		realmID       *string
+		name          string
+		tokenHash     string
+		scopesRaw     []byte
+		isActive      bool
+		revokedAt     *time.Time
+		expiresAt     *time.Time
+		rateLimitInt  *int
+		rateLimitType *string
 	)
 
 	err := pool.QueryRow(ctx, `
 		SELECT id, entity_id, realm_id, name, token_hash, scopes,
-		       is_active, revoked_at, expires_at
+		       is_active, revoked_at, expires_at,
+		       rate_limit_int, rate_limit_type
 		  FROM entity_token
 		 WHERE prefix = $1`, prefix,
 	).Scan(&id, &entityID, &realmID, &name, &tokenHash, &scopesRaw,
-		&isActive, &revokedAt, &expiresAt)
+		&isActive, &revokedAt, &expiresAt, &rateLimitInt, &rateLimitType)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No such prefix. An unknown token and a revoked one are
@@ -222,11 +232,13 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 	}
 
 	return &Token{
-		ID:       id,
-		EntityID: entityID,
-		RealmID:  realmID,
-		Name:     name,
-		Scopes:   scopes,
+		ID:            id,
+		EntityID:      entityID,
+		RealmID:       realmID,
+		Name:          name,
+		Scopes:        scopes,
+		RateLimitInt:  rateLimitInt,
+		RateLimitType: rateLimitType,
 	}, nil
 }
 

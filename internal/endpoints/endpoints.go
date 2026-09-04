@@ -93,8 +93,10 @@ func (h *Handlers) WhoAmI(w http.ResponseWriter, r *http.Request) {
 		"realm_id":  token.RealmID,
 		"scopes":    token.Scopes,
 		"token": map[string]any{
-			"id":   token.ID,
-			"name": token.Name,
+			"id":              token.ID,
+			"name":            token.Name,
+			"rate_limit_int":  token.RateLimitInt,
+			"rate_limit_type": token.RateLimitType,
 		},
 	})
 }

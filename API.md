@@ -58,6 +58,7 @@ someone else's value to.
 | `401` | missing/malformed `Authorization`, or an unknown, revoked or expired token |
 | `403` | authenticated, but the scope or the entity grant is missing |
 | `404` | not found **or** not permitted — deliberately indistinguishable |
+| `429` | this token has exceeded its own `rate_limit_per_minute` |
 | `500` | server fault; the response carries no detail |
 | `503` | a dependency is unreachable, or the token could not be **checked** |
 
@@ -75,6 +76,12 @@ apart could enumerate ids.
 as `Invalid or expired token`, which sends you to rotate a perfectly good
 credential. A credential that could not be *checked* is now `503`, and the
 failure is logged server-side.
+
+**`429` carries a `Retry-After` header** (seconds until the current window
+resets). It fires only for a token with a non-`NULL`
+`entity_token.rate_limit_int`/`rate_limit_type` pair — every existing token is
+`NULL` (unlimited) until someone sets one. The window can be per second,
+minute, hour, day, week, month or year — see the token-issuing section above.
 
 ---
 
@@ -134,7 +141,12 @@ bootstrapping problem with no upside.
   "realm_id": null,
   "scopes": ["messages.read", "notifications.read", "messages.send",
              "comments.create", "events.subscribe"],
-  "token": { "id": "b8866403-…", "name": "rag pipeline (prod)" }
+  "token": {
+    "id": "b8866403-…",
+    "name": "rag pipeline (prod)",
+    "rate_limit_int": 100000,
+    "rate_limit_type": "month"
+  }
 }
 ```
 

@@ -54,19 +54,24 @@ func main() {
 
 	handlers := &endpoints.Handlers{Conns: conns, Cfg: cfg, Queue: publisher}
 
+	// One limiter, shared by every route below: it is stateless (the window
+	// key already carries the token id), so there is no reason for each route
+	// to hold its own.
+	rateLimiter := auth.NewRedisRateLimitStore(conns.Redis)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handlers.Health)
 	mux.HandleFunc("GET /ready", handlers.Ready)
 
 	// Authenticated routes. WhoAmI needs only a valid credential; Events also
 	// needs the scope, checked against both the token and the entity.
-	mux.Handle("GET /v1/whoami", auth.Middleware(conns.Postgres,
+	mux.Handle("GET /v1/whoami", auth.Middleware(conns.Postgres, rateLimiter,
 		http.HandlerFunc(handlers.WhoAmI)))
-	mux.Handle("GET /v1/events", auth.Middleware(conns.Postgres,
+	mux.Handle("GET /v1/events", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionEventsSubscribe,
 			http.HandlerFunc(handlers.Events))))
 	mux.Handle("GET /v1/conversations/{conversationID}/messages",
-		auth.Middleware(conns.Postgres,
+		auth.Middleware(conns.Postgres, rateLimiter,
 			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
 				http.HandlerFunc(handlers.ConversationMessages))))
 	// "Which recent messages here reply to something I wrote." Same scope as
@@ -74,13 +79,13 @@ func main() {
 	// the same messages, answered server-side so a client does not have to pull
 	// the whole window to find out.
 	mux.Handle("GET /v1/conversations/{conversationID}/replies",
-		auth.Middleware(conns.Postgres,
+		auth.Middleware(conns.Postgres, rateLimiter,
 			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
 				http.HandlerFunc(handlers.ConversationReplies))))
-	mux.Handle("GET /v1/mentions/comments", auth.Middleware(conns.Postgres,
+	mux.Handle("GET /v1/mentions/comments", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.CommentMentions))))
-	mux.Handle("GET /v1/comments/replies", auth.Middleware(conns.Postgres,
+	mux.Handle("GET /v1/comments/replies", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.CommentReplies))))
 	// Gated on notifications.read because that is the scope a consumer holds
@@ -89,13 +94,13 @@ func main() {
 	// instead, and inventing one here would mean a Django migration before
 	// this service could gate anything on it. Move it if the catalog gains
 	// `comments.read`.
-	mux.Handle("GET /v1/posts/{postID}/comments", auth.Middleware(conns.Postgres,
+	mux.Handle("GET /v1/posts/{postID}/comments", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.PostComments))))
-	mux.Handle("POST /v1/messages/send", auth.Middleware(conns.Postgres,
+	mux.Handle("POST /v1/messages/send", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionMessagesSend,
 			http.HandlerFunc(handlers.SendMessage))))
-	mux.Handle("POST /v1/comments", auth.Middleware(conns.Postgres,
+	mux.Handle("POST /v1/comments", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionCommentsCreate,
 			http.HandlerFunc(handlers.CreateComment))))
 
