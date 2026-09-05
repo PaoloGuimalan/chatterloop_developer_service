@@ -79,10 +79,13 @@ const commentAuthorPreview = 30
 // comment:
 //
 //  1. the insert
-//  2. update_ranking_score - the worker owns comments_count
-//  3. bump_interest_affinity - carrying the POST's interest ids
-//  4. the reply / post-comment notification, with its realtime frame
-//  5. comment-mention notifications, one per entity named
+//  2. the post_activity frame on the POST's channel, which is what makes the
+//     comment appear in a comment section somebody already has open - see
+//     post_activity.go for why a notification cannot do that job
+//  3. update_ranking_score - the worker owns comments_count
+//  4. bump_interest_affinity - carrying the POST's interest ids
+//  5. the reply / post-comment notification, with its own per-entity frame
+//  6. comment-mention notifications, one per entity named
 //
 // NOT performed, each for a stated reason:
 //
@@ -253,6 +256,19 @@ func commentFanOut(
 	post *postRow,
 	repliedTo *parentComment,
 ) []string {
+	// FIRST, and matching the order Django publishes in - but the reason is
+	// its own: this is the only part of the fan-out somebody is WAITING on.
+	// The queues below feed workers, the notifications below feed trays; this
+	// feeds a comment section that is open right now, with a person watching
+	// it. Everything after it can be a second late without anyone noticing.
+	//
+	// storedParentFor is called again rather than threaded through: it is the
+	// same pure function that decided where the row went, so the two cannot
+	// disagree, and `parent_id` must name where the row LANDED rather than
+	// what the author aimed at - see commentActivityFields.
+	publishCommentCreated(ctx, deps, req.PostID, commentID,
+		storedParentFor(repliedTo), authorEntityID)
+
 	deps.Queue.Publish(ctx, queue.UpdateRankingScore, queue.RankingPayload{
 		PostID: req.PostID, UpdateType: "comment", IsDecrease: false,
 	})

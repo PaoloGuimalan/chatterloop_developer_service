@@ -205,6 +205,12 @@ the notification routes, never by parsing the sentence.
 > **There is no replay.** Frames published while you are disconnected are gone.
 > The database is the record; the stream is only a hint.
 
+**This stream is one of two axes.** It carries `events_<entity_id>` — frames
+addressed to *you*. Activity addressed to a *post* (`post_activity` on
+`post_<post_id>`) is a separate channel with a separate audience; `POST
+/v1/comments` publishes to it, and this route does not subscribe you to it. See
+that route for the shape.
+
 ---
 
 ### `GET /v1/conversations/{conversationID}/messages`
@@ -493,6 +499,70 @@ yourself** — that is reimplementing the rule this route exists to own.
 
 The person actually replied to is still notified; that comes off `parentID`, not
 off where the row landed.
+
+#### The comment also goes out on the post's realtime channel
+
+Writing the row and its notifications makes your comment **arrive**. It does not
+make it **appear**. The person sitting in the comment section you are answering
+in is already looking at the thread — a notification addressed to them is not
+what tells them, and until this route published it, a bot's answer sat in the
+database until the asker reloaded the page.
+
+So this route also publishes to the **post's** channel, the same one Django
+publishes human comments to:
+
+```
+channel    post_<post_id>
+SSE event  post_activity
+```
+
+```json
+{
+  "status": true, "auth": true, "message": "comment",
+  "result": {
+    "post_id": "762856…",
+    "event_type": "comment",
+    "comment_id": "9c07147d-…",
+    "parent_id": "c20d8d61-…",
+    "entity": {
+      "entity_id": "ca0e358b-…",
+      "handle": "helper",
+      "name": "Helper Bot",
+      "type": "bot"
+    }
+  }
+}
+```
+
+This is a **different axis** from `/v1/events`. That stream is addressed to a
+*person* ("something happened that concerns you"); this one is addressed to a
+*post* ("something happened here") and reaches whoever is reading it, including
+people the comment concerns not at all. A comment would otherwise have to be
+published once per reader, and nothing knows who the readers are.
+
+| | |
+|---|---|
+| `event_type` | `comment` \| `typing` \| `reaction` \| `share`. **Ignore an `event_type` you do not know** rather than treating it as an error — that is what lets a new one ship as a publisher change alone. This route publishes `comment` only. |
+| `parent_id` | **where the row landed**, not what you aimed at. `null` means the top-level list; anything else names the thread to refetch. |
+| `entity.entity_id` | compare it against your own to recognise **your own echo** — you already applied that change optimistically, and acting on it again double-counts it. |
+
+The body carries **ids and the actor's identity, never the comment text.**
+Subscribers refetch through the platform's comments read, which is where post
+visibility is enforced — so this channel only ever says there is something new
+to fetch.
+
+**Reading this channel is not part of this API.** `/v1/events` subscribes you to
+`events_<entity_id>` and nothing else; the post channel is bridged to browsers
+by Node's `/p/ssePostActivity/{token}`, which gates the subscription on being
+allowed to see the post. This route is a **publisher** on it.
+
+**Bots are named by their `@handle`, not their UUID.** Django resolves the
+actor's `handle` with `get_entity_profile_path()`, which has branches for a user
+and a realm and **none for a bot** — but a bot entity can never be the acting
+entity in Django, so that branch is unreachable there rather than wrong. Here
+the caller is a bot nearly every time, so bots resolve through `bot_bot.handle`:
+the same handle `get_entity_display_username()` already uses, and the one value
+a comment header can actually render.
 
 `notified` lists the entities told about the comment: the person replied to (or
 the post's author for a top-level comment), plus anyone `@mentioned` in the

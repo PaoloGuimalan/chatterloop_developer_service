@@ -12,8 +12,8 @@ person at a browser — bots first, third-party integrations next.
                         ▼                 ▼               ▼                  ▼
                     Postgres           Mongo           Redis             RabbitMQ
                  entity_token      conversations   events_<entity>      send_push
-                 permissions       messages        (sub + pub)          bump_chat_score
-                 comments          notifications                        update_ranking_score
+                 permissions       messages        post_<post_id>       bump_chat_score
+                 comments          notifications   (sub + pub)          update_ranking_score
                  posts, handles                                         bump_interest_affinity
 ```
 
@@ -264,13 +264,82 @@ row landed.
 ### The fan-out
 
 Performed, because a comment without them is a row rather than a comment: the
-insert, `update_ranking_score` (the worker owns `comments_count`),
+insert, the **`post_activity` frame on the post's own channel** (below),
+`update_ranking_score` (the worker owns `comments_count`),
 `bump_interest_affinity` carrying the *post's* interest ids, the
 reply/post-comment notification with its realtime frame, and one
 comment-mention notification per entity named — resolved across all three
 handle namespaces (`user_account.username`, `community_realm.slug`,
 `bot_bot.handle`), filtered by the platform's visibility bar, and dropped for
 anyone in a block relationship with the author in either direction.
+
+### Arriving is not appearing
+
+Writing the row and its notifications makes a bot's comment *arrive*. It does
+not make it *appear*. The person sitting in the comment section they just asked
+a question in is **not** the person a notification is addressed to — they are
+already looking at the thread, and `events_<entity_id>` has nothing to say to
+them about a post they are reading. So a bot's reply landed in the database and
+the asker saw nothing until they reloaded: **the one reader most likely to be
+watching was the one reader not told.**
+
+There are two axes of realtime, and they are not interchangeable:
+
+| channel | addressed to | says |
+|---|---|---|
+| `events_<entity_id>` | a **person** | "something happened that concerns you" |
+| `post_<post_id>` | a **post** | "something happened here" |
+
+The post channel is the only one that can reach a reader nobody knows about. A
+comment would otherwise have to be published once per reader, and nothing knows
+who the readers are.
+
+Django closes this gap for comments written through it
+(`newsfeed/services/post_realtime.py`); Node owns the `typing` event on the same
+channel, because typing is never stored and the service that owns comment rows
+has no opinion about it. `POST /v1/comments` is now the third publisher of the
+shape, for the write path Django does not own — event `post_activity`, body
+`{post_id, event_type, comment_id, parent_id, entity}`, carrying ids and the
+actor's identity and **never the comment text**. Subscribers refetch through the
+platform's comments read, which is where post visibility is enforced.
+
+Changing that shape now means changing three services, and it is recorded in
+each.
+
+**`parent_id` names where the row landed, not what the author aimed at** — the
+flattening above means those differ one level down, and publishing the aimed-at
+id would send every reader to refetch a thread the comment is not in while the
+thread it *is* in never refreshes.
+
+**Not deferred to commit, unlike Django's.** Django's publish goes through
+`transaction.on_commit()` because it is called from inside `transaction.atomic()`
+— the event makes the receiver come back and read rows the caller is still
+writing, and inline it is a race the receiver usually wins. Here the insert is
+its own autocommitted statement and has already returned before any fan-out
+runs, so there is nothing to defer to. **If the comment write is ever wrapped in
+a transaction, this publish has to move with it.**
+
+**One divergence from Django, and it is the point of the feature.** Django
+resolves the actor's `handle` with `get_entity_profile_path()`, which has
+branches for an Account and a Realm and **none for a Bot** — a bot falls through
+to `str(entity.id)`.
+
+Django can afford that because a bot entity cannot *be* `request.entity` there,
+by two independent routes: its auth backend resolves the caller through
+`Account.objects.get()` plus a live device session, which a bot has neither of,
+and entity switching — the only thing that makes `request.entity` something
+other than the account — accepts users and page realms only. `_actor()` never
+sees a bot, so the missing branch is unreachable rather than wrong.
+
+Reproducing it *here*, where the caller is a bot essentially every time, would
+ship a frame naming its actor with a UUID — the one identity a comment section
+cannot render. So bots resolve through `bot_bot.handle`, which is what
+`get_entity_display_username()` already does and what this service's own
+`HandlesFor()` does everywhere else. **This is not really a divergence: it is
+the only implementation of a bot actor that ever runs.** It becomes one the day
+Django grows bot authentication or lets a user switch into a bot they own — and
+the fix then is a `bots` branch in `get_entity_profile_path()`, not a change
+here.
 
 **Two side effects this does NOT perform:**
 

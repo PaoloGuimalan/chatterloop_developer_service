@@ -360,14 +360,28 @@ func mentionPushData(conversationID, senderEntityID, title, body, messageID stri
 	}
 }
 
-// publishFrame writes one realtime frame in the exact envelope the platform's
-// Redis publisher produces (server/reusables/redis/pubsub.js publish()).
+// publishFrame writes one realtime frame addressed to a PERSON.
 //
 // Node's SSE bridge and this service's own stream both subscribe to
 // `events_<entity_id>`, so one write reaches browsers and API clients alike -
 // which is why this does not go through RabbitMQ the way the platform's
 // internal fan-out does.
+//
+// The OTHER axis is a post's own channel, addressed to whoever is reading it
+// rather than to anyone in particular; see post_activity.go. Both go out in
+// the same envelope, which is why publishEnvelope is separate from this.
 func publishFrame(ctx context.Context, deps Deps, entityID, event string, message any) {
+	publishEnvelope(ctx, deps, "events_"+entityID, event, message)
+}
+
+// publishEnvelope writes one frame to `channel` in the exact envelope the
+// platform's Redis publisher produces (server/reusables/redis/pubsub.js
+// publish()), which is what the subscribers on the other end unwrap.
+//
+// Channel-agnostic on purpose: the envelope is the platform's, not any one
+// channel's, and a second copy of it per channel is a second thing to keep in
+// step with the two publishers that already write it.
+func publishEnvelope(ctx context.Context, deps Deps, channel, event string, message any) {
 	envelope := map[string]any{
 		"logType":  nil,
 		"pod":      deps.PodName,
@@ -377,11 +391,11 @@ func publishFrame(ctx context.Context, deps Deps, entityID, event string, messag
 	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
-		slog.Error("frame encode failed", "error", err)
+		slog.Error("frame encode failed", "channel", channel, "error", err)
 		return
 	}
-	if err := deps.Redis.Publish(ctx, "events_"+entityID, body).Err(); err != nil {
-		slog.Error("frame publish failed", "entity_id", entityID, "error", err)
+	if err := deps.Redis.Publish(ctx, channel, body).Err(); err != nil {
+		slog.Error("frame publish failed", "channel", channel, "error", err)
 	}
 }
 
