@@ -24,6 +24,7 @@ import (
 	"developer_service/internal/config"
 	"developer_service/internal/connections"
 	"developer_service/internal/platform"
+	"developer_service/internal/presence"
 	"developer_service/internal/queue"
 	"developer_service/internal/stream"
 )
@@ -154,6 +155,27 @@ func (h *Handlers) Events(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
 		return
 	}
+
+	// Holding this stream open is what "this bot is online" MEANS - there is
+	// no other signal a bot emits continuously, and no login for it to have
+	// performed. So the session row is written here and cleared when Serve
+	// returns, mirroring exactly what Node does around its own SSE stream
+	// (setUserSession true/false in routes/users/index.js).
+	//
+	// The credential's prefix stands in for a browser's deviceToken; see the
+	// presence package doc for why that is the right identifier rather than
+	// something generated per connection.
+	recorder := presence.Recorder{
+		Mongo:     h.Conns.Mongo,
+		Postgres:  h.Conns.Postgres,
+		Redis:     h.Conns.Redis,
+		JWTSecret: h.Cfg.JWTSecret,
+		PodName:   h.Cfg.PodName,
+	}
+	recorder.Connected(r.Context(), token.EntityID, token.Prefix, token.Name)
+	// Runs on every return path Serve has, including the lifetime cap and a
+	// client that simply vanished.
+	defer recorder.Disconnected(token.EntityID, token.Prefix)
 
 	stream.Serve(r.Context(), w, h.Conns.Redis, token.EntityID, stream.Options{
 		Heartbeat:   h.Cfg.Heartbeat,

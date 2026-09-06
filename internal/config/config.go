@@ -45,6 +45,22 @@ type Config struct {
 	// bounded lifetime turns "leaked forever" into "reconnects hourly", and
 	// every client already needs reconnect logic for the network anyway.
 	MaxStreamLifetime time.Duration
+
+	// Signs the `active_users` presence frame. The SAME secret Node signs the
+	// same event with (server/reusables/hooks/jwthelper.js createJWTwExp) -
+	// both clients call a decode on that frame unconditionally, so a frame
+	// this service published unsigned would be unparseable rather than merely
+	// unverified.
+	//
+	// The one value this service needs supplied to own presence end to end
+	// rather than handing the fan-out to another process. Already set
+	// wherever Node runs, so it is the same "no new secrets story" this
+	// package's doc describes - not a new secret, a shared one.
+	//
+	// OPTIONAL, and degrades rather than breaks: with it unset the session
+	// row is still written and the dot still appears on the next
+	// /u/activecontacts snapshot; only the live push is lost.
+	JWTSecret string
 }
 
 func Load() (*Config, error) {
@@ -57,6 +73,7 @@ func Load() (*Config, error) {
 		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
 		Heartbeat:         envDuration("SSE_HEARTBEAT_SECONDS", 20*time.Second),
 		MaxStreamLifetime: envDuration("SSE_MAX_LIFETIME_SECONDS", time.Hour),
+		JWTSecret:         os.Getenv("JWT_SECRET"),
 	}
 
 	// DATABASE_URL wins when set (that is how most hosts inject it); otherwise

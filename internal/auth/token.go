@@ -119,6 +119,16 @@ type Token struct {
 	RealmID  *string
 	Name     string
 	Scopes   []string
+	// The clear-text lookup half, `clt_<prefix>_<secret>`'s middle segment.
+	// Carried rather than discarded after Verify splits it because it is the
+	// stable per-instance identifier the presence layer uses as a device
+	// token: one credential is meant for one running instance, so its prefix
+	// names that instance across reconnects without anything having to be
+	// generated, stored or handed out. See internal/presence.
+	//
+	// NOT a secret: it travels in the clear inside every token, which is the
+	// whole reason verification can find a row with one indexed lookup.
+	Prefix string
 	// Requests this token may make per RateLimitType (a RateLimitPeriod
 	// value: "second".."year"). Both nil means unlimited; set together or
 	// left blank together (entity/models.py Token.clean() enforces the
@@ -237,6 +247,7 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 		RealmID:       realmID,
 		Name:          name,
 		Scopes:        scopes,
+		Prefix:        prefix,
 		RateLimitInt:  rateLimitInt,
 		RateLimitType: rateLimitType,
 	}, nil
