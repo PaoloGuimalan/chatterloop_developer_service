@@ -63,6 +63,23 @@ func (h *Handlers) Ready(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": true})
 }
 
+// Version reports the release this process is running. APP_VERSION is set from
+// the image tag at deploy time, so a mismatch between what this returns and the
+// tag that was pushed means the rollout did not take.
+//
+// Unauthenticated, which is a deliberate departure from Health's silence about
+// version above: a deploy check is only useful if it works from anywhere with
+// curl, and putting it behind a token gates it on the service being healthy
+// enough to authenticate - the thing most in doubt when you are asking. The
+// trade is that the running release is public; move it behind auth.Middleware
+// if that is not acceptable.
+func (h *Handlers) Version(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service": "developer_service",
+		"version": h.Cfg.AppVersion,
+	})
+}
+
 // WhoAmI describes the calling credential.
 //
 // No scope of its own: a credential may always describe itself, and requiring

@@ -19,6 +19,10 @@ type Config struct {
 	// writes, so a frame can be traced back to the process that emitted it.
 	PodName string
 
+	// The release this build came from, set from the image tag at deploy time.
+	// Reported by GET /version so a rollout can be confirmed from outside.
+	AppVersion string
+
 	// Where fan-out jobs go. The Go worker already consumes send_push and
 	// bump_chat_score, so this service publishes rather than reimplementing
 	// Firebase or the scoring rules.
@@ -67,6 +71,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Port:              env("PORT", "8890"),
 		PodName:           env("POD_NAME", env("HOSTNAME", "podless")),
+		AppVersion:        env("APP_VERSION", "dev"),
 		RabbitMQURL:       rabbitURL(),
 		RedisAddr:         fmt.Sprintf("%s:%s", env("REDIS_HOST", "localhost"), env("REDIS_PORT", "6379")),
 		RedisUsername:     os.Getenv("REDIS_USERNAME"),

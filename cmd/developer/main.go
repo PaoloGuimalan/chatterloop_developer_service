@@ -62,6 +62,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handlers.Health)
 	mux.HandleFunc("GET /ready", handlers.Ready)
+	mux.HandleFunc("GET /version", handlers.Version)
 
 	// Authenticated routes. WhoAmI needs only a valid credential; Events also
 	// needs the scope, checked against both the token and the entity.
