@@ -289,6 +289,122 @@ taken from the token.
 
 ---
 
+### `GET /v1/conversations/{conversationID}/messages/{messageID}/thread`
+
+One reply **lineage**: the chain of messages `{messageID}` answers, oldest
+first, ending with the message itself.
+
+The partner of `/messages`, not a replacement. That route answers *what is
+going on here*; this one answers *what is this about*, and neither can be
+derived from the other — a window of the newest messages cannot contain the
+subject of a reply to something forty turns back at any size worth sending,
+and a lineage says nothing about what else has been said since, including
+somebody correcting it or answering first.
+
+| query | default | max |
+|---|---|---|
+| `limit` | 20 | 50 |
+
+`limit` bounds the **ancestors walked**, so a long thread returns its most
+recent `limit` turns rather than failing.
+
+```json
+{
+  "status": true,
+  "conversation_id": "50945793330147641378",
+  "conversation_type": "group",
+  "message_id": "129551082102633792144718379671",
+  "root_message_id": "852415598414984663247460944845",
+  "depth": 3,
+  "truncated": false,
+  "count": 4,
+  "messages": [ /* root first, the same shape as /messages */ ]
+}
+```
+
+**`truncated`** is the field worth reading. It is `true` when the walk stopped
+at `limit`, or at a deleted or unreadable link — in both cases what you have is
+the tail of a longer thread, not the thread. Without it a partial lineage is
+indistinguishable from a complete one, and those call for quite different
+behaviour from whatever consumes them.
+
+`root_message_id` is the message that started the thread, the one replying to
+nothing. **Empty when `truncated`**, because then it was never reached and
+naming the oldest message that happened to come back would be a guess presented
+as a fact.
+
+The traversal cannot leave the conversation. Every hop is pinned to
+`conversationID`, so a corrupted or crafted `replyingTo` cannot pull a message
+out of a conversation you have no access to — the participant check having been
+made against the conversation, not against every message the chain reaches.
+
+`404` for a message that is not in this conversation, **and** for one that does
+not exist, **and** for a conversation you are not a participant of. One answer
+for all three: a caller able to tell them apart can probe for messages by id.
+
+---
+
+### `GET /v1/entities/search`
+
+A directory lookup across the three namespaces — users, realms and bots.
+
+"Who is @ana?" and "is there a page for support?" are questions no conversation
+can answer, because everything a bot can see is whoever happened to speak in
+it. This is what lets an agent act on a name somebody gave it.
+
+| query | default | max |
+|---|---|---|
+| `q` | — | — |
+| `limit` | 10 | 25 |
+| `kind` | all | `user`, `realm`, `bot` — comma-separated |
+
+`q` is matched against handle **and** display name, case-insensitively. A
+leading `@` is ignored, and fewer than two characters returns nothing rather
+than most of the platform. Prefix matches rank above contained ones, so `ana`
+finds `@ana` before `@banana`.
+
+```json
+{
+  "status": true,
+  "query": "ana",
+  "count": 2,
+  "entities": [
+    {
+      "entity_id": "c6f3bf0c-…",
+      "kind": "user",
+      "handle": "ana",
+      "name": "Ana Reyes",
+      "profile": "https://…"
+    },
+    {
+      "entity_id": "9d2e5a11-…",
+      "kind": "realm",
+      "handle": "analytics-team",
+      "name": "Analytics Team",
+      "profile": "none"
+    }
+  ]
+}
+```
+
+Visibility is the platform's own bar, not a new one: an account must be active
+**and verified**, a realm and a bot active. That is `entity_side_is_visible()`,
+the same rule mentions apply — so everything findable here was already
+addressable by typing its handle, and this adds reach rather than access.
+
+Blocking applies in **both directions**, matching mentions. Search would
+otherwise be a way around a block: find the handle here, address it there.
+
+The caller is never in its own results. An agent searching for somebody to talk
+to does not mean itself.
+
+Gated on `messages.read`. None of the five codenames in the platform's catalog
+describes a directory, and a scope invented here would match no grant and
+refuse everybody — Django owns that table. Worth revisiting as
+`entities.search` the next time `user_service/entity/permissions.py` is touched.
+
+---
+
 ### `GET /v1/mentions/comments`
 
 Unread `comment_mention` notifications addressed to you, with the comment text

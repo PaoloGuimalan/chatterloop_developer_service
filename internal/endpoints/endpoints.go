@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"developer_service/internal/auth"
 	"developer_service/internal/config"
@@ -249,6 +250,115 @@ func (h *Handlers) ConversationMessages(w http.ResponseWriter, r *http.Request) 
 		"conversation_type": conversation.ConversationType,
 		"count":             len(messages),
 		"messages":          messages,
+	})
+}
+
+// ConversationThread serves one reply lineage: the chain of messages a given
+// message answers, oldest first, ending with the message itself.
+//
+// The partner of /messages rather than a replacement for it. That route
+// answers "what is going on here"; this one answers "what is this about" - and
+// neither can be derived from the other. A window of the newest messages
+// cannot contain the subject of a reply to something forty turns back at any
+// size worth sending, and a lineage says nothing about what else has been said
+// since, including somebody correcting it or answering first.
+//
+// The walk is bounded by `limit` and reports `truncated` when that is what
+// stopped it, so a caller can tell the whole thread from its tail.
+func (h *Handlers) ConversationThread(w http.ResponseWriter, r *http.Request) {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	messageID := r.PathValue("messageID")
+	limit := readLimit(r, 20, 50)
+
+	conversation, err := platform.LoadConversation(r.Context(), h.Conns.Mongo, h.Conns.Postgres, conversationID, token.EntityID)
+	if err != nil {
+		if errors.Is(err, platform.ErrNotAParticipant) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status": false, "message": "Conversation not found.",
+			})
+			return
+		}
+		slog.Error("conversation lookup failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+
+	thread, err := platform.ReplyThread(r.Context(), h.Conns.Mongo, conversationID, messageID, limit)
+	if err != nil {
+		if errors.Is(err, platform.ErrMessageNotFound) {
+			// The same 404 as a conversation nobody may read. A caller able to
+			// tell "not here" from "does not exist" can probe for messages by id.
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status": false, "message": "Message not found in this conversation.",
+			})
+			return
+		}
+		slog.Error("thread read failed",
+			"conversation_id", conversationID, "message_id", messageID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+	h.resolveHandles(r, thread.Messages)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":            true,
+		"conversation_id":   conversationID,
+		"conversation_type": conversation.ConversationType,
+		"message_id":        messageID,
+		"root_message_id":   thread.RootMessageID,
+		"depth":             thread.Depth,
+		"truncated":         thread.Truncated,
+		"count":             len(thread.Messages),
+		"messages":          thread.Messages,
+	})
+}
+
+// SearchEntities serves a directory lookup across users, realms and bots.
+//
+// Gated on messages.read. None of the five scopes in the platform's catalog
+// describes a directory, and adding one means a codename in
+// user_service/entity/permissions.py - Django owns that table, so a scope
+// invented here would match no grant and refuse everybody. messages.read is
+// the honest fit of the five: this is a read, and everything it returns was
+// already addressable by typing the handle into a message.
+//
+// Worth revisiting as `entities.search` the next time that catalog is touched.
+func (h *Handlers) SearchEntities(w http.ResponseWriter, r *http.Request) {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	limit := readLimit(r, 10, 25)
+
+	var kinds []string
+	if raw := r.URL.Query().Get("kind"); raw != "" {
+		kinds = strings.Split(raw, ",")
+	}
+
+	found, err := platform.SearchEntities(
+		r.Context(), h.Conns.Postgres, query, kinds, limit, token.EntityID)
+	if err != nil {
+		slog.Error("entity search failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+	if found == nil {
+		found = []platform.FoundEntity{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   true,
+		"query":    query,
+		"count":    len(found),
+		"entities": found,
 	})
 }
 

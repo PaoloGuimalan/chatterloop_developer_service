@@ -83,6 +83,21 @@ func main() {
 		auth.Middleware(conns.Postgres, rateLimiter,
 			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
 				http.HandlerFunc(handlers.ConversationReplies))))
+	// "What is this reply about." The partner of /messages: that route is a
+	// window on the conversation, this one is the lineage of one thread, and a
+	// window cannot contain the subject of a reply to something far enough
+	// back. Same scope as reading the conversation, because it is a filtered
+	// read of the same messages.
+	mux.Handle("GET /v1/conversations/{conversationID}/messages/{messageID}/thread",
+		auth.Middleware(conns.Postgres, rateLimiter,
+			auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
+				http.HandlerFunc(handlers.ConversationThread))))
+	// "Who is @ana, and is there a page for support?" - questions no
+	// conversation can answer, because everything a bot can see is whoever
+	// happened to speak in it.
+	mux.Handle("GET /v1/entities/search", auth.Middleware(conns.Postgres, rateLimiter,
+		auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
+			http.HandlerFunc(handlers.SearchEntities))))
 	mux.Handle("GET /v1/mentions/comments", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.CommentMentions))))
