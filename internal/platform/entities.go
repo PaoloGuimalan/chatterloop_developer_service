@@ -51,6 +51,14 @@ type FoundEntity struct {
 // A block either way removes the entity, matching mentions. Search would
 // otherwise be a way around a block: find the handle here, address it there.
 //
+// # EVERY TEXT COLUMN IS COALESCED
+//
+// Not defensive habit: community_realm.slug is NULL on most active realms,
+// because a realm gets a slug only once somebody sets one. Scanning that into
+// a string fails the whole query, so the search 500s on any term that happens
+// to match a slugless realm by NAME - which looks like an outage on one search
+// term and works fine on the next.
+//
 // # THE VIEWER IS NOT IN ITS OWN RESULTS
 //
 // An agent searching for somebody to talk to does not mean itself, and a bot
@@ -85,23 +93,25 @@ func SearchEntities(
 		SELECT entity_id, kind, handle, name, profile FROM (
 			SELECT entity_id,
 			       'user'::text AS kind,
-			       username     AS handle,
+			       coalesce(username,'') AS handle,
 			       btrim(coalesce(first_name,'') || ' ' || coalesce(last_name,'')) AS name,
 			       coalesce(profile,'') AS profile
 			  FROM user_account
 			 WHERE is_active AND is_verified
-			   AND (lower(username) LIKE $2
+			   AND (lower(coalesce(username,'')) LIKE $2
 			     OR lower(coalesce(first_name,'') || ' ' || coalesce(last_name,'')) LIKE $2)
 			 UNION ALL
-			SELECT entity_id, 'realm'::text, slug, name, coalesce(profile,'')
+			SELECT entity_id, 'realm'::text,
+			       coalesce(slug,''), coalesce(name,''), coalesce(profile,'')
 			  FROM community_realm
 			 WHERE is_active
 			   AND (lower(coalesce(slug,'')) LIKE $2 OR lower(coalesce(name,'')) LIKE $2)
 			 UNION ALL
-			SELECT entity_id, 'bot'::text, handle, name, coalesce(profile,'')
+			SELECT entity_id, 'bot'::text,
+			       coalesce(handle,''), coalesce(name,''), coalesce(profile,'')
 			  FROM bot_bot
 			 WHERE is_active
-			   AND (lower(handle) LIKE $2 OR lower(coalesce(name,'')) LIKE $2)
+			   AND (lower(coalesce(handle,'')) LIKE $2 OR lower(coalesce(name,'')) LIKE $2)
 		) AS found
 		 WHERE entity_id IS NOT NULL
 		   AND entity_id <> $4
@@ -115,7 +125,6 @@ func SearchEntities(
 	defer rows.Close()
 
 	found := make([]FoundEntity, 0, limit)
-	ids := make([]string, 0, limit)
 	for rows.Next() {
 		var entity FoundEntity
 		if err := rows.Scan(&entity.EntityID, &entity.Kind, &entity.Handle,
@@ -123,7 +132,6 @@ func SearchEntities(
 			return nil, err
 		}
 		found = append(found, entity)
-		ids = append(ids, entity.EntityID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
