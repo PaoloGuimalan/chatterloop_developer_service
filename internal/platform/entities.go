@@ -59,6 +59,17 @@ type FoundEntity struct {
 // to match a slugless realm by NAME - which looks like an outage on one search
 // term and works fine on the next.
 //
+// # SYSTEM BOTS ARE NOT DISCOVERABLE
+//
+// `is_system` marks a bot that belongs to the platform rather than to anyone -
+// it answers commands, is not a member of any conversation, and cannot be
+// joined or addressed. Returning it here would offer a handle that leads
+// nowhere, which is worse than not finding it.
+//
+// Note this is a SEARCH, not a resolver. GetSenderDetails and HandlesFor must
+// keep finding system bots by entity id, or their messages render with a blank
+// name - discovery and resolution want opposite answers here.
+//
 // # THE VIEWER IS NOT IN ITS OWN RESULTS
 //
 // An agent searching for somebody to talk to does not mean itself, and a bot
@@ -110,7 +121,7 @@ func SearchEntities(
 			SELECT entity_id, 'bot'::text,
 			       coalesce(handle,''), coalesce(name,''), coalesce(profile,'')
 			  FROM bot_bot
-			 WHERE is_active
+			 WHERE is_active AND NOT is_system
 			   AND (lower(coalesce(handle,'')) LIKE $2 OR lower(coalesce(name,'')) LIKE $2)
 		) AS found
 		 WHERE entity_id IS NOT NULL
