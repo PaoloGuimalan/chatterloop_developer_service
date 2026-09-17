@@ -52,3 +52,39 @@ func TestKindFilterWithOnlyUnknownKindsMeansEveryKind(t *testing.T) {
 		t.Fatalf("expected nil for all kinds, got %v", want)
 	}
 }
+
+// ProfileRedirect is the only pure part of building a result row, and the case that
+// matters is the empty one: most active realms have a NULL slug, so a naive
+// concatenation links to the bare origin for a large slice of the platform.
+
+func TestProfileRedirectBuildsAClientLink(t *testing.T) {
+	if got := ProfileRedirect("https://chatterloop.app", "neon"); got != "https://chatterloop.app/neon" {
+		t.Fatalf("unexpected url: %q", got)
+	}
+}
+
+func TestProfileRedirectIsEmptyWithoutAHandle(t *testing.T) {
+	for _, handle := range []string{"", "   "} {
+		if got := ProfileRedirect("https://chatterloop.app", handle); got != "" {
+			t.Fatalf("a handleless entity must have no link, got %q", got)
+		}
+	}
+}
+
+func TestProfileRedirectTrimsTheHandle(t *testing.T) {
+	if got := ProfileRedirect("https://chatterloop.app", "  neon  "); got != "https://chatterloop.app/neon" {
+		t.Fatalf("unexpected url: %q", got)
+	}
+}
+
+func TestProfileRedirectIsEmptyWithoutABase(t *testing.T) {
+	if got := ProfileRedirect("", "neon"); got != "" {
+		t.Fatalf("no base means no link, got %q", got)
+	}
+}
+
+func TestProfileRedirectToleratesATrailingSlashOnTheBase(t *testing.T) {
+	if got := ProfileRedirect("https://chatterloop.app/", "neon"); got != "https://chatterloop.app/neon" {
+		t.Fatalf("unexpected url: %q", got)
+	}
+}

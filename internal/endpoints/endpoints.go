@@ -353,6 +353,12 @@ func (h *Handlers) SearchEntities(w http.ResponseWriter, r *http.Request) {
 	if found == nil {
 		found = []platform.FoundEntity{}
 	}
+	// Enriched here rather than in the query, because it is presentation and
+	// the base is configuration - the same division resolveHandles follows.
+	for i := range found {
+		found[i].ProfileRedirect = platform.ProfileRedirect(
+			h.Cfg.WebClientBaseURL, found[i].Handle)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   true,

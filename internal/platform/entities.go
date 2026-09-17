@@ -27,7 +27,28 @@ type FoundEntity struct {
 	Kind     string `json:"kind"`
 	Handle   string `json:"handle"`
 	Name     string `json:"name"`
-	Profile  string `json:"profile"`
+
+	// The AVATAR, from the platform's own `profile` column - an image URL, not
+	// a page. Named for the column it comes from.
+	Profile string `json:"profile"`
+
+	// The entity's page on the web client. Empty when the entity has no
+	// handle, which is not hypothetical: most active realms have a NULL slug,
+	// and a link to the bare origin is worse than no link at all.
+	ProfileRedirect string `json:"profile_redirect"`
+}
+
+// ProfileRedirect is where a handle lives on the web client, or "" for an entity
+// that has no handle to put there.
+//
+// Takes the base rather than reading config, so this package stays free of it -
+// the handler supplies it, the same way it supplies handles via resolveHandles.
+func ProfileRedirect(base, handle string) string {
+	handle = strings.TrimSpace(handle)
+	if handle == "" || base == "" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + "/" + handle
 }
 
 // SearchEntities finds users, realms and bots by handle or name.

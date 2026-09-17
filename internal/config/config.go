@@ -6,6 +6,7 @@
 package config
 
 import (
+	"strings"
 	"fmt"
 	"os"
 	"strconv"
@@ -65,6 +66,15 @@ type Config struct {
 	// row is still written and the dot still appears on the next
 	// /u/activecontacts snapshot; only the live push is lost.
 	JWTSecret string
+
+	// Where a handle is a page on the web client, used to build the
+	// `profile_redirect` on a searched entity.
+	//
+	// Defaulted rather than required: it is a public origin, not a secret, and
+	// a deployment that never sets it should still return working links rather
+	// than half a URL. Set it on staging so results do not link people into
+	// production.
+	WebClientBaseURL string
 }
 
 func Load() (*Config, error) {
@@ -79,6 +89,7 @@ func Load() (*Config, error) {
 		Heartbeat:         envDuration("SSE_HEARTBEAT_SECONDS", 20*time.Second),
 		MaxStreamLifetime: envDuration("SSE_MAX_LIFETIME_SECONDS", time.Hour),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
+		WebClientBaseURL:  strings.TrimRight(env("WEB_CLIENT_BASE_URL", "https://chatterloop.app"), "/"),
 	}
 
 	// DATABASE_URL wins when set (that is how most hosts inject it); otherwise

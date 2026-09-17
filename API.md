@@ -374,18 +374,31 @@ finds `@ana` before `@banana`.
       "kind": "user",
       "handle": "ana",
       "name": "Ana Reyes",
-      "profile": "https://…"
+      "profile": "https://…",
+      "profile_redirect": "https://chatterloop.app/ana"
     },
     {
       "entity_id": "9d2e5a11-…",
       "kind": "realm",
       "handle": "analytics-team",
       "name": "Analytics Team",
-      "profile": "none"
+      "profile": "none",
+      "profile_redirect": "https://chatterloop.app/analytics-team"
     }
   ]
 }
 ```
+
+`profile` is the **avatar**, named for the column it comes from. `profile_redirect`
+is the entity's **page** on the web client — and is **empty for an entity with
+no handle**, which is common: most active realms have a NULL slug, and a link
+to the bare origin would be worse than no link.
+
+System bots are never returned. `is_system` marks a bot belonging to the
+platform rather than to anyone — not a member of any conversation, not
+joinable — so a handle for one leads nowhere. Note this applies to *search*
+only: resolving a sender by entity id must still find them, or their messages
+render with no name.
 
 Visibility is the platform's own bar, not a new one: an account must be active
 **and verified**, a realm and a bot active. That is `entity_side_is_visible()`,
