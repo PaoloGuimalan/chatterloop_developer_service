@@ -161,6 +161,132 @@ func (h *Handlers) PostComments(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// moderationIDCap bounds a batch. One answer reads the media in one window of
+// a conversation, and a caller needing more than this is enumerating rather
+// than reading a thread.
+const moderationIDCap = 50
+
+// MessageModeration returns what is known about the media in given messages.
+//
+// The point of the route: a message carrying an upload stores a CDN URL in
+// `content`, so a reader that shows a model `content` shows it a URL. This is
+// where the transcript, the caption and the text read out of the image come
+// from.
+//
+// Gated on messages.read - the same scope the caller must already hold to read
+// the message itself - and authorised PER MESSAGE inside, because a scope says
+// what kind of thing may be read, never which ones.
+func (h *Handlers) MessageModeration(w http.ResponseWriter, r *http.Request) {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
+		return
+	}
+
+	ids := readIDs(r, "messageID", moderationIDCap)
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": false, "message": "Pass at least one messageID.",
+		})
+		return
+	}
+
+	records, err := platform.ModerationForMessages(
+		r.Context(), h.Conns.Mongo, h.Conns.Postgres, ids, token.EntityID)
+	if err != nil {
+		slog.Error("message moderation read failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": true, "count": len(records), "moderation": records,
+	})
+}
+
+// PostModeration returns what is known about a post and its attachments.
+//
+// One call rather than one per attachment: a bot asked to comment on a post
+// needs to know what the post IS before it can say anything about it, and that
+// is the caption plus whatever was in the media.
+func (h *Handlers) PostModeration(w http.ResponseWriter, r *http.Request) {
+	if _, ok := auth.FromContext(r.Context()); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
+		return
+	}
+
+	postID := r.PathValue("postID")
+	records, err := platform.ModerationForPost(
+		r.Context(), h.Conns.Mongo, h.Conns.Postgres, postID)
+	if err != nil {
+		if errors.Is(err, platform.ErrPostNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"status": false, "message": "Post not found.",
+			})
+			return
+		}
+		slog.Error("post moderation read failed", "post_id", postID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": true, "post_id": postID,
+		"count": len(records), "moderation": records,
+	})
+}
+
+// CommentModeration returns what is known about the media on given comments.
+func (h *Handlers) CommentModeration(w http.ResponseWriter, r *http.Request) {
+	if _, ok := auth.FromContext(r.Context()); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
+		return
+	}
+
+	ids := readIDs(r, "commentID", moderationIDCap)
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": false, "message": "Pass at least one commentID.",
+		})
+		return
+	}
+
+	records, err := platform.ModerationForComments(
+		r.Context(), h.Conns.Mongo, h.Conns.Postgres, ids)
+	if err != nil {
+		slog.Error("comment moderation read failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": true, "count": len(records), "moderation": records,
+	})
+}
+
+// readIDs collects a repeatable id parameter, trimmed and capped.
+//
+// Both `?messageID=a&messageID=b` and `?messageID=a,b` are accepted: the first
+// is what a Go or Python client produces from a list, the second is what
+// somebody types into curl, and refusing either would be a difference nothing
+// in the request explains.
+func readIDs(r *http.Request, name string, cap int) []string {
+	ids := []string{}
+	for _, raw := range r.URL.Query()[name] {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			ids = append(ids, part)
+			if len(ids) == cap {
+				return ids
+			}
+		}
+	}
+	return ids
+}
+
 // Events streams the calling entity's realtime frames.
 //
 // The entity is taken from the TOKEN, never from the request. There is no

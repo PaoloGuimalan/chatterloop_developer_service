@@ -98,6 +98,9 @@ minute, hour, day, week, month or year — see the token-issuing section above.
 | `GET` | `/v1/mentions/comments` | `notifications.read` |
 | `GET` | `/v1/comments/replies` | `notifications.read` |
 | `GET` | `/v1/posts/{postID}/comments` | `notifications.read` |
+| `GET` | `/v1/moderation/messages` | `messages.read` |
+| `GET` | `/v1/moderation/posts/{postID}` | `notifications.read` |
+| `GET` | `/v1/moderation/comments` | `notifications.read` |
 | `POST` | `/v1/messages/send` | `messages.send` |
 | `POST` | `/v1/comments` | `comments.create` |
 
@@ -539,6 +542,107 @@ two levels, so that is the only nesting there is.
 anyone — `CommentsView.get()` is `AllowAny` and applies no post-privacy filter
 — so requiring a valid token here is already stricter than the platform, and
 this route does not invent a visibility rule the platform does not have.
+
+---
+
+### `GET /v1/moderation/messages`
+
+**What is inside the media**, so a consumer answering a photo or a voice note
+knows what it is.
+
+| query | default | max |
+|---|---|---|
+| `messageID` | — | 50 ids |
+
+Repeatable (`?messageID=a&messageID=b`) or comma-separated (`?messageID=a,b`).
+Both forms count toward the same cap.
+
+```json
+{
+  "status": true,
+  "count": 2,
+  "moderation": [
+    {
+      "target_id": "m-8f21…",
+      "source_type": "message",
+      "content_type": "audio",
+      "media_url": "https://cdn.chatterloop.app/…/note.m4a",
+      "status": "done",
+      "transcription": "Hey, can you push the meeting to Thursday?",
+      "language": "en",
+      "is_music": false
+    },
+    {
+      "target_id": "m-3c07…",
+      "source_type": "message",
+      "content_type": "image",
+      "media_url": "https://cdn.chatterloop.app/…/board.jpg",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+**Why this route exists.** A message carrying an upload stores the CDN URL in
+`content` and the mime in `message_type`. A consumer that shows a model
+`content` shows it a URL, and a model shown a URL answers the URL. The
+moderation pipeline has already transcribed, captioned and read the text out of
+that same file — this is the only way to use it.
+
+| field | |
+|---|---|
+| `status` | `pending` \| `processing` \| `done` \| `failed` \| `skipped`. **The only field never omitted** |
+| `transcription` | what was said |
+| `caption` | an assembled description: what the picture shows, what is written in it, what it sounds like |
+| `shown_text` | text read **out of** an image (OCR), as opposed to describing it |
+| `text` | the authored text, for a text unit rather than media |
+| `is_music` | absent means nothing classified the audio — which is not the same as `false` |
+
+**Analysis is asynchronous, so `status` is part of the contract.** A message
+seconds old is usually `pending`, and the text fields are then absent. That is
+why a pending document is returned rather than filtered out: a consumer has to
+tell *"there is no media"* from *"it has not been read yet"*, and only the
+second one is worth saying out loud to a person.
+
+**What this route will not tell you.** The moderation document also holds a
+verdict, its categories and scores, whether it was auto-reported, which report
+it became, the content hash, the model that ran and the interest-graph tags.
+**None of it is returned.** Those describe what the *platform decided* about
+somebody else's content, and a developer credential asking what is in a video
+has no business learning it. The response is built from an explicit allow-list,
+so a field added to the document later is private by default.
+
+**Authorisation is per message, not per scope.** `messages.read` says what
+*kind* of thing may be read; it never says which ones. Each id is resolved back
+to its conversation and checked with the same membership rule
+`GET /v1/conversations/{id}/messages` applies. **An id you may not see is
+dropped from the response, not refused** — a `404` for it would answer the
+question the check exists to refuse, by confirming the id is real. "You may not
+see it", "it does not exist" and "it has no moderation document" are one
+indistinguishable answer.
+
+---
+
+### `GET /v1/moderation/posts/{postID}`
+
+The same shape for a post: its own caption analysis **and** every attachment,
+in one read. `404` if the post does not exist or is deleted — the same
+condition `GET /v1/posts/{postID}/comments` applies, and for the same reason
+this route does not invent a visibility rule the platform does not have.
+
+Useful before commenting: a consumer asked to reply to a post can otherwise see
+the caption text but not what is in the image everybody else is talking about.
+
+---
+
+### `GET /v1/moderation/comments`
+
+| query | default | max |
+|---|---|---|
+| `commentID` | — | 50 ids |
+
+Same shape again, for comment attachments. A comment on a deleted post, or one
+that does not exist, is absent from the response rather than refused.
 
 ---
 

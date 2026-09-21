@@ -113,6 +113,27 @@ func main() {
 	mux.Handle("GET /v1/posts/{postID}/comments", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
 			http.HandlerFunc(handlers.PostComments))))
+	// What the moderation pipeline already learned about a piece of content.
+	//
+	// THREE ROUTES, NOT ONE, because each one can be gated on the scope the
+	// caller must already hold to read the underlying thing: a message is
+	// messages.read, a post or a comment is notifications.read. A single
+	// route taking all three kinds would have to be gated on whichever is
+	// weaker and then re-check inside, which is a scope that means something
+	// different depending on a query parameter.
+	//
+	// Authorisation is per target INSIDE each of them - see
+	// platform.ModerationForMessages. A scope says what kind of thing may be
+	// read, never which ones.
+	mux.Handle("GET /v1/moderation/messages", auth.Middleware(conns.Postgres, rateLimiter,
+		auth.RequireScope(conns.Postgres, auth.PermissionMessagesRead,
+			http.HandlerFunc(handlers.MessageModeration))))
+	mux.Handle("GET /v1/moderation/posts/{postID}", auth.Middleware(conns.Postgres, rateLimiter,
+		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
+			http.HandlerFunc(handlers.PostModeration))))
+	mux.Handle("GET /v1/moderation/comments", auth.Middleware(conns.Postgres, rateLimiter,
+		auth.RequireScope(conns.Postgres, auth.PermissionNotificationsRead,
+			http.HandlerFunc(handlers.CommentModeration))))
 	mux.Handle("POST /v1/messages/send", auth.Middleware(conns.Postgres, rateLimiter,
 		auth.RequireScope(conns.Postgres, auth.PermissionMessagesSend,
 			http.HandlerFunc(handlers.SendMessage))))
