@@ -155,7 +155,7 @@ func SendMessage(ctx context.Context, deps Deps, senderEntityID string, req Send
 		"seeners":    bson.A{senderEntityID},
 		"content":    content,
 		"isReply":    req.ReplyingTo != "",
-		"replyingTo": req.ReplyingTo,
+		"replyingTo": storedReplyingTo(req.ReplyingTo),
 		"reactions":  bson.A{},
 		"isDeleted":  false,
 		// A BSON date, which is the shape the platform's send route produces
@@ -540,4 +540,16 @@ func nilIfEmpty(value string) any {
 		return nil
 	}
 	return value
+}
+
+// storedReplyingTo is what a message's `replyingTo` holds for a reply to the
+// message `messageID`: {type: "message", id}, the one shape every writer now
+// produces (see Node server/reusables/hooks/replyTargets.js). "" when the
+// message is not a reply. Readers still accept the bare-id string older rows
+// hold - decodeReplyingTo.
+func storedReplyingTo(messageID string) any {
+	if messageID == "" {
+		return ""
+	}
+	return bson.M{"type": ReplyTargetMessage, "id": messageID}
 }

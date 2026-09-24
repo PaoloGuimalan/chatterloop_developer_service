@@ -41,6 +41,22 @@ type Message struct {
 	// one field comparison instead of a second fetch and a guess.
 	ReplyingToSenderEntityID string `json:"replying_to_sender_entity_id"`
 	ReplyingToSenderHandle   string `json:"replying_to_sender_handle"`
+
+	// WHAT THIS MESSAGE REPLIES TO, whatever kind of thing that is. Nil when
+	// it is not a reply. For a message reply it restates ReplyingTo with type
+	// "message"; for a reply to a post, moment or thought it is the only field
+	// that says so, since ReplyingTo stays a message id (and so is "").
+	ReplyTarget *ReplyTarget `json:"reply_target,omitempty"`
+}
+
+// ReplyTargetMessage is ReplyTarget.Type for a reply to a message.
+const ReplyTargetMessage = "message"
+
+// ReplyTarget names what a message replies to: "message", "post", "moment"
+// or "thought", and that thing's id.
+type ReplyTarget struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
 }
 
 type Conversation struct {
@@ -268,7 +284,7 @@ func decodeMessage(raw bson.M, conversationID string) (Message, bool) {
 		messageType = "text"
 	}
 	isReply, _ := raw["isReply"].(bool)
-	replyingTo, _ := raw["replyingTo"].(string)
+	replyingTo, replyTarget := decodeReplyingTo(raw["replyingTo"])
 	if stored, _ := raw["conversationID"].(string); stored != "" {
 		conversationID = stored
 	}
@@ -282,7 +298,46 @@ func decodeMessage(raw bson.M, conversationID string) (Message, bool) {
 		MessageType:    messageType,
 		IsReply:        isReply,
 		ReplyingTo:     replyingTo,
+		ReplyTarget:    replyTarget,
 	}, true
+}
+
+// decodeReplyingTo reads a stored `replyingTo`, which has two shapes (see Node
+// server/reusables/hooks/replyTargets.js):
+//
+//   - {type: "message"|"post"|"moment"|"thought", id} - what every writer
+//     produces now.
+//   - a bare string - a message id, as every row written before that holds.
+//
+// The first return is what `replying_to` has always carried: the id of the
+// MESSAGE replied to, or "". So a message reply reads exactly as it always
+// has whichever shape it is stored in, and a reply to a post, moment or
+// thought reads as "" - a bot threading on replying_to, or comparing it with
+// its own message ids, sees no change. The second return names the target
+// whatever it is.
+func decodeReplyingTo(value any) (string, *ReplyTarget) {
+	switch stored := value.(type) {
+	case string:
+		if stored == "" {
+			return "", nil
+		}
+		return stored, &ReplyTarget{Type: ReplyTargetMessage, ID: stored}
+	case bson.M:
+		targetType, _ := stored["type"].(string)
+		targetID, _ := stored["id"].(string)
+		if targetType == "" || targetID == "" {
+			return "", nil
+		}
+		target := &ReplyTarget{Type: targetType, ID: targetID}
+		if targetType == ReplyTargetMessage {
+			return targetID, target
+		}
+		return "", target
+	case bson.D:
+		return decodeReplyingTo(stored.Map())
+	default:
+		return "", nil
+	}
 }
 
 // resolveReplyParents fills ReplyingToSenderEntityID for every reply in the

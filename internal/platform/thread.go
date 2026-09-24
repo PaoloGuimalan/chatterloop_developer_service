@@ -3,7 +3,6 @@ package platform
 import (
 	"context"
 	"errors"
-	"sort"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -52,13 +51,18 @@ type Thread struct {
 // one would be a way to read any message in any conversation by guessing ids.
 // Walking here keeps the reachability rule where the conversation is known.
 //
-// # ONE ROUND TRIP
+// # TWO LINK SHAPES, SO SEGMENTS
 //
-// $graphLookup follows the chain inside the database rather than making the
-// caller issue a query per hop. This is the first aggregation in the service,
-// and it earns that on a path that runs for every answer a bot gives: twenty
-// hops as twenty sequential round trips to Atlas is most of a second, and the
-// `messageID` index makes the same work here a single call.
+// `replyingTo` is stored as {type: "message", id} now and as a bare id string
+// on older rows (decodeReplyingTo). $graphLookup follows ONE field path, so no
+// single traversal can cross from one shape to the other. Each round trip
+// (ancestorSegment) therefore runs two traversals from the same starting
+// message - one along `replyingTo.id`, one along `replyingTo` - and the chain
+// is then followed link by link through everything either returned
+// (linkedAncestors). A chain written in one shape takes one round trip; one
+// that crosses into older rows takes another from where the first stopped.
+// Since a reply always points at an EARLIER message, a chain changes shape at
+// most once in practice, so this is one or two round trips - not one per hop.
 //
 // # THE TRAVERSAL CANNOT LEAVE THE CONVERSATION
 //
@@ -81,50 +85,22 @@ func ReplyThread(
 		limit = 1
 	}
 
-	// maxDepth counts hops BEYOND the first. The traversal starts at
-	// `$replyingTo`, so depth 0 is already the parent, and `limit` ancestors
-	// means maxDepth limit-1.
-	maxDepth := limit - 1
+	collection := db.Collection("messages")
 
-	within := bson.M{
+	var anchorRaw bson.M
+	err := collection.FindOne(ctx, bson.M{
+		"messageID":      messageID,
 		"conversationID": conversationID,
 		"isDeleted":      bson.M{"$ne": true},
-	}
-
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$match", Value: bson.M{
-			"messageID":      messageID,
-			"conversationID": conversationID,
-			"isDeleted":      bson.M{"$ne": true},
-		}}},
-		bson.D{{Key: "$graphLookup", Value: bson.M{
-			"from":                    "messages",
-			"startWith":               "$replyingTo",
-			"connectFromField":        "replyingTo",
-			"connectToField":          "messageID",
-			"as":                      "ancestors",
-			"maxDepth":                maxDepth,
-			"depthField":              "ancestorDepth",
-			"restrictSearchWithMatch": within,
-		}}},
-	}
-
-	cursor, err := db.Collection("messages").Aggregate(ctx, pipeline)
+	}).Decode(&anchorRaw)
 	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return Thread{}, ErrMessageNotFound
+		}
 		return Thread{}, err
 	}
-	defer cursor.Close(ctx)
 
-	var raws []bson.M
-	if err := cursor.All(ctx, &raws); err != nil {
-		return Thread{}, err
-	}
-	if len(raws) == 0 {
-		return Thread{}, ErrMessageNotFound
-	}
-
-	root := raws[0]
-	anchor, ok := decodeMessage(root, conversationID)
+	anchor, ok := decodeMessage(anchorRaw, conversationID)
 	if !ok {
 		// An image or file message. It is a real message and a real anchor,
 		// but there is nothing to return for it and nothing that reads this
@@ -132,7 +108,38 @@ func ReplyThread(
 		return Thread{}, ErrMessageNotFound
 	}
 
-	ancestors, truncated := orderAncestors(root["ancestors"], conversationID, limit)
+	// Nearest first while walking; reversed into a transcript at the end.
+	var nearestFirst []Message
+	var hops int64
+	parent := anchor.ReplyingTo
+
+	for parent != "" && hops < limit {
+		found, err := ancestorSegment(ctx, collection, conversationID, parent, limit-hops)
+		if err != nil {
+			return Thread{}, err
+		}
+		chain, next, used := linkedAncestors(found, parent, conversationID, limit-hops)
+		if used == 0 {
+			// The parent is not reachable - deleted, or not in this
+			// conversation. The walk ends here, and `parent` still set is what
+			// reports the thread as incomplete.
+			break
+		}
+		nearestFirst = append(nearestFirst, chain...)
+		hops += used
+		parent = next
+	}
+
+	ancestors := make([]Message, 0, len(nearestFirst))
+	for i := len(nearestFirst) - 1; i >= 0; i-- {
+		ancestors = append(ancestors, nearestFirst[i])
+	}
+
+	// Truncated when the oldest link we reached still replies to something:
+	// the limit stopped the walk, or a link was deleted or unreadable. To
+	// anything consuming this both mean the same thing - what you have is not
+	// the whole thread.
+	truncated := parent != ""
 
 	thread := Thread{
 		Messages:  append(ancestors, anchor),
@@ -154,67 +161,110 @@ func ReplyThread(
 	return thread, nil
 }
 
-// orderAncestors turns $graphLookup's unordered output into oldest-first, and
-// reports whether the chain was cut short.
+// ancestorSegment reads the message `startID` and everything above it that
+// two traversals reach - one following `replyingTo.id`, one following a
+// bare-string `replyingTo` - within `budget` messages, keyed by messageID.
 //
-// Split out because it IS the tricky part: the traversal returns a set with a
-// depth on each element and no order at all, and getting this backwards
-// silently hands a model the conversation in reverse.
-func orderAncestors(raw any, conversationID string, limit int64) ([]Message, bool) {
-	entries := asSlice(raw)
-	if len(entries) == 0 {
-		return nil, false
+// Unordered on purpose: linkedAncestors decides the order by following the
+// links themselves, which is what makes mixing two traversals safe.
+func ancestorSegment(
+	ctx context.Context,
+	collection *mongo.Collection,
+	conversationID, startID string,
+	budget int64,
+) (map[string]bson.M, error) {
+	within := bson.M{
+		"conversationID": conversationID,
+		"isDeleted":      bson.M{"$ne": true},
 	}
 
-	type scored struct {
-		depth   int64
-		message Message
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.M{
+			"messageID":      startID,
+			"conversationID": conversationID,
+			"isDeleted":      bson.M{"$ne": true},
+		}}},
 	}
 
-	found := make([]scored, 0, len(entries))
-	deepest := int64(-1)
-	var deepestParent string
-
-	for _, entry := range entries {
-		document := asDocument(entry)
-		if document == nil {
-			continue
+	// The start message is one of the `budget`; maxDepth counts hops beyond
+	// the traversal's first match, so budget-1 more messages is budget-2.
+	if budget > 1 {
+		// The start message's own parent, whichever shape it is stored in.
+		startWith := bson.M{"$ifNull": bson.A{"$replyingTo.id", "$replyingTo"}}
+		for _, link := range []struct{ field, as string }{
+			{"replyingTo.id", "viaObject"},
+			{"replyingTo", "viaString"},
+		} {
+			pipeline = append(pipeline, bson.D{{Key: "$graphLookup", Value: bson.M{
+				"from":                    "messages",
+				"startWith":               startWith,
+				"connectFromField":        link.field,
+				"connectToField":          "messageID",
+				"as":                      link.as,
+				"maxDepth":                budget - 2,
+				"restrictSearchWithMatch": within,
+			}}})
 		}
-		depth := asInt64(document["ancestorDepth"])
-		message, ok := decodeMessage(document, conversationID)
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var raws []bson.M
+	if err := cursor.All(ctx, &raws); err != nil {
+		return nil, err
+	}
+
+	found := make(map[string]bson.M)
+	for _, root := range raws {
+		for _, key := range []string{"viaObject", "viaString"} {
+			for _, entry := range asSlice(root[key]) {
+				if document := asDocument(entry); document != nil {
+					if id, _ := document["messageID"].(string); id != "" {
+						found[id] = document
+					}
+				}
+			}
+		}
+		if id, _ := root["messageID"].(string); id != "" {
+			found[id] = root
+		}
+	}
+	return found, nil
+}
+
+// linkedAncestors follows the reply chain from `parentID` through `found`,
+// for at most `budget` links, and returns the messages NEAREST FIRST, the
+// parent id it stopped at ("" once the thread's root is reached), and how many
+// links it followed.
+//
+// Split out because it IS the tricky part, and it is pure. An image or file
+// in the chain is followed but not returned - there is nothing to read in it -
+// so a thread keeps going past a photo someone replied to.
+func linkedAncestors(
+	found map[string]bson.M,
+	parentID, conversationID string,
+	budget int64,
+) ([]Message, string, int64) {
+	var chain []Message
+	var used int64
+	next := parentID
+
+	for next != "" && used < budget {
+		document, ok := found[next]
 		if !ok {
-			// An image in the middle of a thread. Skipped rather than fatal,
-			// but it does break the chain, so the walk above it is reported as
-			// truncated by the parent check below.
-			continue
+			break
 		}
-		found = append(found, scored{depth: depth, message: message})
-		if depth > deepest {
-			deepest = depth
-			deepestParent = message.ReplyingTo
+		if message, readable := decodeMessage(document, conversationID); readable {
+			chain = append(chain, message)
 		}
+		used++
+		next, _ = decodeReplyingTo(document["replyingTo"])
 	}
-	if len(found) == 0 {
-		return nil, false
-	}
-
-	// Depth counts AWAY from the anchor, so descending depth is oldest first.
-	sort.Slice(found, func(i, j int) bool { return found[i].depth > found[j].depth })
-
-	messages := make([]Message, 0, len(found))
-	for _, item := range found {
-		messages = append(messages, item.message)
-	}
-
-	// Truncated when the oldest ancestor we reached still replies to something.
-	//
-	// Read off the DATA rather than by comparing the count to the limit. Both
-	// produce the right answer when the limit is what stopped the walk, but a
-	// chain also stops early on a deleted or unreadable link - and to anything
-	// consuming this those mean the same thing: what you have is not the whole
-	// thread. One condition covers both; the count comparison covers one and
-	// quietly claims completeness for the other.
-	return messages, deepestParent != ""
+	return chain, next, used
 }
 
 // asSlice accepts what the driver actually hands back for an embedded array.
@@ -242,26 +292,5 @@ func asDocument(raw any) map[string]any {
 		return value
 	default:
 		return nil
-	}
-}
-
-// asInt64 normalises a BSON number.
-//
-// $graphLookup's depthField is a NumberLong, which decodes as int64 - not the
-// int32 an ordinary small integer arrives as. Asserting the wrong one yields
-// zero for every element, which does not error: it sorts the whole chain as a
-// tie and hands back a thread in arbitrary order.
-func asInt64(raw any) int64 {
-	switch value := raw.(type) {
-	case int64:
-		return value
-	case int32:
-		return int64(value)
-	case int:
-		return int64(value)
-	case float64:
-		return int64(value)
-	default:
-		return 0
 	}
 }

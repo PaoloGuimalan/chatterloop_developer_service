@@ -6,135 +6,156 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-// orderAncestors is the part of the reply walk that can be wrong quietly.
-// $graphLookup returns a SET with a depth on each element and no order at all,
-// so getting this backwards hands whatever reads the thread a conversation in
-// reverse - which reads perfectly well and answers the wrong turn.
+// linkedAncestors is the part of the reply walk that can be wrong quietly: it
+// decides the ORDER of the thread by following links, across two stored
+// shapes of `replyingTo`. Getting it backwards hands whatever reads the thread
+// a conversation in reverse - which reads perfectly well and answers the wrong
+// turn.
 
-// depth arrives as a NumberLong from $graphLookup's depthField, so the
-// fixtures use int64 - an int32 fixture would pass against an int32
-// assertion and prove nothing about the real thing.
-func ancestor(id, parent string, depth int64) bson.M {
+// A message whose replyingTo is the bare-id string older rows hold.
+func legacy(id, parent string) bson.M {
 	return bson.M{
-		"messageID":     id,
-		"replyingTo":    parent,
-		"sender":        "entity-1",
-		"content":       "text of " + id,
-		"messageType":   "text",
-		"isReply":       parent != "",
-		"ancestorDepth": depth,
+		"messageID":   id,
+		"replyingTo":  parent,
+		"sender":      "entity-1",
+		"content":     "text of " + id,
+		"messageType": "text",
+		"isReply":     parent != "",
 	}
 }
 
-// entries builds what the driver hands back for an embedded array: a bson.A,
-// not a []any. The distinction is the whole point of asSlice.
-func entries(documents ...bson.M) bson.A {
-	out := make(bson.A, 0, len(documents))
+// A message whose replyingTo is {type: "message", id}, as every writer
+// produces now. No parent is stored as "" in both shapes.
+func current(id, parent string) bson.M {
+	document := legacy(id, parent)
+	if parent != "" {
+		document["replyingTo"] = bson.M{"type": "message", "id": parent}
+	}
+	return document
+}
+
+func index(documents ...bson.M) map[string]bson.M {
+	found := make(map[string]bson.M, len(documents))
 	for _, document := range documents {
-		out = append(out, document)
+		found[document["messageID"].(string)] = document
+	}
+	return found
+}
+
+func ids(messages []Message) []string {
+	out := make([]string, 0, len(messages))
+	for _, message := range messages {
+		out = append(out, message.MessageID)
 	}
 	return out
 }
 
-func TestOrderAncestorsReturnsOldestFirst(t *testing.T) {
-	// depth counts AWAY from the anchor: 0 is the parent, 2 the oldest.
-	raw := entries(
-		ancestor("m2", "m1", 1),
-		ancestor("m3", "m2", 0),
-		ancestor("m1", "", 2),
-	)
-
-	messages, truncated := orderAncestors(raw, "conv-1", 10)
-
-	if truncated {
-		t.Fatal("a chain that reached the root is not truncated")
+func sameIDs(t *testing.T, got []Message, want ...string) {
+	t.Helper()
+	gotIDs := ids(got)
+	if len(gotIDs) != len(want) {
+		t.Fatalf("got %v, want %v", gotIDs, want)
 	}
-	got := []string{messages[0].MessageID, messages[1].MessageID, messages[2].MessageID}
-	want := []string{"m1", "m2", "m3"}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("out of order: got %v, want %v", got, want)
+		if gotIDs[i] != want[i] {
+			t.Fatalf("out of order: got %v, want %v", gotIDs, want)
 		}
 	}
 }
 
-func TestOrderAncestorsReportsTruncationAtTheLimit(t *testing.T) {
-	// The oldest one we reached still replies to something, and we have as
-	// many as we asked for - the walk stopped because of the limit.
-	raw := entries(
-		ancestor("m9", "m8", 0),
-		ancestor("m8", "m7", 1),
+func TestLinkedAncestorsReturnsNearestFirst(t *testing.T) {
+	found := index(legacy("m3", "m2"), legacy("m2", "m1"), legacy("m1", ""))
+
+	chain, next, used := linkedAncestors(found, "m3", "conv-1", 10)
+
+	sameIDs(t, chain, "m3", "m2", "m1")
+	if next != "" || used != 3 {
+		t.Fatalf("a chain that reached its root: next=%q used=%d", next, used)
+	}
+}
+
+// The whole point of the rewrite: a new reply ({type, id}) pointing into a
+// thread of older bare-id rows is ONE chain, followed straight through.
+func TestLinkedAncestorsCrossesFromObjectToStringLinks(t *testing.T) {
+	found := index(
+		current("n2", "n1"),
+		current("n1", "o2"),
+		legacy("o2", "o1"),
+		legacy("o1", ""),
 	)
 
-	_, truncated := orderAncestors(raw, "conv-1", 2)
+	chain, next, used := linkedAncestors(found, "n2", "conv-1", 10)
 
-	if !truncated {
-		t.Fatal("a chain cut short by the limit must say so")
+	sameIDs(t, chain, "n2", "n1", "o2", "o1")
+	if next != "" || used != 4 {
+		t.Fatalf("mixed chain not followed to its root: next=%q used=%d", next, used)
 	}
 }
 
-// A chain can also stop early because a link is deleted or unreadable. To
-// anything consuming this that means the same thing as hitting the limit -
-// what you have is not the whole thread - so it must report the same way.
-func TestOrderAncestorsReportsTruncationOnABrokenLink(t *testing.T) {
-	raw := entries(ancestor("m9", "m8-which-is-gone", 0))
+func TestLinkedAncestorsStopsAtTheBudget(t *testing.T) {
+	found := index(current("m9", "m8"), current("m8", "m7"), current("m7", ""))
 
-	_, truncated := orderAncestors(raw, "conv-1", 10)
+	chain, next, used := linkedAncestors(found, "m9", "conv-1", 2)
 
-	if !truncated {
-		t.Fatal("a chain with a missing parent must say so")
+	sameIDs(t, chain, "m9", "m8")
+	if next != "m7" || used != 2 {
+		t.Fatalf("the walk must stop at the budget and say where: next=%q used=%d", next, used)
 	}
 }
 
-func TestOrderAncestorsOnARootParentIsNotTruncated(t *testing.T) {
-	raw := entries(ancestor("m1", "", 0))
+// A link that is not in `found` - deleted, or in another conversation - ends
+// the walk with the missing id still in hand, which is what ReplyThread
+// reports as truncated.
+func TestLinkedAncestorsStopsOnABrokenLink(t *testing.T) {
+	found := index(current("m9", "m8-which-is-gone"))
 
-	messages, truncated := orderAncestors(raw, "conv-1", 10)
+	chain, next, used := linkedAncestors(found, "m9", "conv-1", 10)
 
-	if truncated {
-		t.Fatal("reaching a message that replies to nothing is the whole thread")
-	}
-	if len(messages) != 1 || messages[0].MessageID != "m1" {
-		t.Fatalf("unexpected chain: %v", messages)
-	}
-}
-
-func TestOrderAncestorsOnNoAncestors(t *testing.T) {
-	messages, truncated := orderAncestors(entries(), "conv-1", 10)
-
-	if len(messages) != 0 {
-		t.Fatalf("expected nothing, got %d", len(messages))
-	}
-	if truncated {
-		t.Fatal("a message that starts its own thread is not a truncated one")
+	sameIDs(t, chain, "m9")
+	if next != "m8-which-is-gone" || used != 1 {
+		t.Fatalf("a broken link must be reported: next=%q used=%d", next, used)
 	}
 }
 
-// Image and file messages decode to nothing. One in the middle of a thread
-// must not take the readable messages down with it, and must not be silently
-// presented as a complete chain either.
-func TestOrderAncestorsSkipsUnreadableMessages(t *testing.T) {
-	image := ancestor("m2", "m1", 0)
+func TestLinkedAncestorsWithAnUnreachableParent(t *testing.T) {
+	chain, next, used := linkedAncestors(index(), "gone", "conv-1", 10)
+
+	if len(chain) != 0 || used != 0 || next != "gone" {
+		t.Fatalf("expected nothing followed: chain=%v next=%q used=%d", ids(chain), next, used)
+	}
+}
+
+// Image and file messages decode to nothing, but they are still LINKS: a
+// thread must carry on past a photo somebody replied to, without returning
+// the photo itself.
+func TestLinkedAncestorsFollowsButSkipsUnreadableMessages(t *testing.T) {
+	image := current("m2", "m1")
 	image["messageType"] = "image"
 	delete(image, "content")
 
-	raw := entries(image, ancestor("m1", "", 1))
+	found := index(current("m3", "m2"), image, legacy("m1", ""))
 
-	messages, _ := orderAncestors(raw, "conv-1", 10)
+	chain, next, used := linkedAncestors(found, "m3", "conv-1", 10)
 
-	for _, message := range messages {
-		if message.MessageID == "m2" {
-			t.Fatal("an image message has no content to return")
-		}
+	sameIDs(t, chain, "m3", "m1")
+	if next != "" || used != 3 {
+		t.Fatalf("the image must count as a link: next=%q used=%d", next, used)
 	}
 }
 
-func TestOrderAncestorsIgnoresMalformedEntries(t *testing.T) {
-	raw := append(entries(ancestor("m1", "", 0)), any("not a document"))
+// A reply to a post, moment or thought is not a message link: the walk
+// treats it as the root, exactly like a message that replies to nothing.
+func TestLinkedAncestorsStopsAtANonMessageReply(t *testing.T) {
+	sendOfPost := legacy("m1", "")
+	sendOfPost["replyingTo"] = bson.M{"type": "post", "id": "post-1"}
+	sendOfPost["isReply"] = true
 
-	messages, _ := orderAncestors(raw, "conv-1", 10)
+	found := index(current("m2", "m1"), sendOfPost)
 
-	if len(messages) != 1 {
-		t.Fatalf("expected the one real message, got %d", len(messages))
+	chain, next, _ := linkedAncestors(found, "m2", "conv-1", 10)
+
+	sameIDs(t, chain, "m2", "m1")
+	if next != "" {
+		t.Fatalf("a post reply has no message parent, got next=%q", next)
 	}
 }

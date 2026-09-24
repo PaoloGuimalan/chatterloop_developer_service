@@ -1,6 +1,10 @@
 package platform
 
-import "testing"
+import (
+	"testing"
+
+	"go.mongodb.org/mongo-driver/bson"
+)
 
 // selectRepliesTo is the rule that decides whether a bot may answer a message
 // that never named it. Everything either side of it is a database round trip;
@@ -73,5 +77,38 @@ func TestDecodeMessageCarriesReplyFields(t *testing.T) {
 	}
 	if message.ConversationID != "conv-1" {
 		t.Fatalf("conversation fallback lost: %q", message.ConversationID)
+	}
+}
+
+// replyingTo is stored as {type, id} now and as a bare message id on older
+// rows. `replying_to` must stay a message id whichever shape holds it (so ""
+// for a reply to a post, moment or thought) - bots thread on it - while
+// reply_target says what it is.
+func TestDecodeReplyingToBothShapes(t *testing.T) {
+	cases := []struct {
+		name       string
+		stored     any
+		wantID     string
+		wantTarget *ReplyTarget
+	}{
+		{"message id", "msg-1", "msg-1", &ReplyTarget{Type: "message", ID: "msg-1"}},
+		{"not a reply", "", "", nil},
+		{"missing", nil, "", nil},
+		{"message as object", bson.M{"type": "message", "id": "msg-2"}, "msg-2", &ReplyTarget{Type: "message", ID: "msg-2"}},
+		{"moment as bson.M", bson.M{"type": "moment", "id": "p1"}, "", &ReplyTarget{Type: "moment", ID: "p1"}},
+		{"post as bson.D", bson.D{{Key: "type", Value: "post"}, {Key: "id", Value: "p2"}}, "", &ReplyTarget{Type: "post", ID: "p2"}},
+		{"object without id", bson.M{"type": "moment"}, "", nil},
+		{"garbage", 42, "", nil},
+	}
+
+	for _, tc := range cases {
+		id, target := decodeReplyingTo(tc.stored)
+		if id != tc.wantID {
+			t.Errorf("%s: replying_to = %q, want %q", tc.name, id, tc.wantID)
+		}
+		if (target == nil) != (tc.wantTarget == nil) ||
+			(target != nil && *target != *tc.wantTarget) {
+			t.Errorf("%s: reply_target = %+v, want %+v", tc.name, target, tc.wantTarget)
+		}
 	}
 }

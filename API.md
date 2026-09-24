@@ -260,6 +260,13 @@ regularly **outside** the window you asked for — a follow-up an hour later
 replies to a message forty turns back. Computing it from the returned array
 gives "unknown" exactly when it matters.
 
+`reply_target` (present only on replies) says what the message replies to:
+`{"type": "message" | "post" | "moment" | "thought", "id": "..."}`. A reply to
+a post, moment or thought (a user answering someone's moment, or sending a
+post into the chat) has `is_reply: true`, `replying_to: ""` and the target
+here - `replying_to` only ever holds a **message** id, so threading on it keeps
+working unchanged.
+
 Image and file messages are omitted: they store non-text content, so there is
 nothing to read or embed.
 
