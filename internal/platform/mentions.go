@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.mongodb.org/mongo-driver/bson"
@@ -27,6 +28,7 @@ type Mention struct {
 	AuthorEntityID string `json:"author_entity_id"`
 	Text           string `json:"text"`
 	AuthorHandle   string `json:"author_handle"`
+	IsAnonymous    bool   `json:"is_anonymous"`
 	// "mention" or "reply". See the constants above.
 	Kind string `json:"kind"`
 
@@ -205,9 +207,15 @@ func commentActivity(
 		return []Mention{}, nil
 	}
 
-	comments, err := commentRows(ctx, pool, commentIDs)
+	comments, err := commentRowsForViewer(ctx, pool, commentIDs, entityID)
 	if err != nil {
 		return nil, err
+	}
+	authorIDs = authorIDs[:0]
+	for _, comment := range comments {
+		if !comment.anonymous {
+			authorIDs = append(authorIDs, comment.entityID)
+		}
 	}
 	handles, err := HandlesFor(ctx, pool, authorIDs)
 	if err != nil {
@@ -231,6 +239,12 @@ func commentActivity(
 			continue
 		}
 		mention.Text = comment.text
+		mention.PostID = comment.postID
+		mention.AuthorEntityID = comment.entityID
+		mention.IsAnonymous = comment.anonymous
+		if mention.IsAnonymous {
+			mention.AuthorEntityID = ""
+		}
 		mention.AuthorHandle = handles[mention.AuthorEntityID]
 		resolved = append(resolved, mention)
 	}
@@ -242,15 +256,22 @@ func commentActivity(
 type commentRow struct {
 	text      string
 	hasParent bool
+	postID    string
+	entityID  string
+	anonymous bool
 }
 
 func commentRows(ctx context.Context, pool *pgxpool.Pool, commentIDs []string) (map[string]commentRow, error) {
+	return commentRowsForViewer(ctx, pool, commentIDs, "")
+}
+
+func commentRowsForViewer(ctx context.Context, pool *pgxpool.Pool, commentIDs []string, viewer string) (map[string]commentRow, error) {
 	unique := dedupe(commentIDs)
 	if len(unique) == 0 {
 		return map[string]commentRow{}, nil
 	}
 	rows, err := pool.Query(ctx, `
-		SELECT comment_id, COALESCE(text, ''), parent_comment_id IS NOT NULL
+		SELECT comment_id, COALESCE(text, ''), parent_comment_id IS NOT NULL, post_id, entity_id, is_anonymous
 		  FROM newsfeed_comment
 		 WHERE comment_id = ANY($1)
 		   AND deleted_at IS NULL`, unique)
@@ -260,13 +281,34 @@ func commentRows(ctx context.Context, pool *pgxpool.Pool, commentIDs []string) (
 	defer rows.Close()
 
 	comments := make(map[string]commentRow, len(unique))
+	postIDs := map[string]bool{}
 	for rows.Next() {
-		var id, text string
-		var hasParent bool
-		if err := rows.Scan(&id, &text, &hasParent); err != nil {
+		var id string
+		var comment commentRow
+		if err := rows.Scan(&id, &comment.text, &comment.hasParent, &comment.postID, &comment.entityID, &comment.anonymous); err != nil {
 			return nil, err
 		}
-		comments[id] = commentRow{text: text, hasParent: hasParent}
+		comments[id] = comment
+		postIDs[comment.postID] = false
 	}
-	return comments, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for postID := range postIDs {
+		access, err := loadPostAccess(ctx, pool, postID, viewer)
+		if errors.Is(err, ErrPostNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		postIDs[postID] = access.permits(viewer, false)
+	}
+	for id, comment := range comments {
+		if !postIDs[comment.postID] {
+			delete(comments, id)
+		}
+	}
+	return comments, nil
 }

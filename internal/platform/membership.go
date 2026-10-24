@@ -38,6 +38,9 @@ func AssertMember(
 	pool *pgxpool.Pool,
 	conversationID, entityID string,
 ) error {
+	if err := assertMessagingCapability(ctx, db, pool, conversationID, entityID); err != nil {
+		return err
+	}
 	var (
 		realmEntityID *string
 		realmType     string
@@ -68,6 +71,9 @@ func assertRealmMember(
 	realmType string,
 	isPrivate bool,
 ) error {
+	if realmType == "community" {
+		return ErrNoAccess
+	}
 	// An open conference is readable by anyone; the platform expresses this by
 	// auto-joining, we express it by allowing.
 	if realmType == "conference" && !isPrivate {
@@ -149,6 +155,9 @@ func Receivers(
 	pool *pgxpool.Pool,
 	conversationID string,
 ) ([]Receiver, error) {
+	if err := assertMessagingCapability(ctx, db, pool, conversationID, ""); err != nil {
+		return nil, err
+	}
 	byConnection, err := queryReceivers(ctx, pool, `
 		SELECT p.id, COALESCE(u.username, r.slug, b.handle, '')
 		  FROM entity_connection uc
@@ -200,6 +209,50 @@ func Receivers(
 		  LEFT JOIN community_realm r ON r.entity_id = p.id AND p.type = 'realm'
 		  LEFT JOIN bot_bot b ON b.entity_id = p.id AND p.type = 'bot'
 		 WHERE p.id = ANY($1)`, participants)
+}
+
+// Community realms are content destinations, never conversational identities.
+// Check both SQL contact endpoints and stored Mongo participants so legacy or
+// malformed conversations cannot turn a community into a messaging target.
+func assertMessagingCapability(ctx context.Context, db *mongo.Database, pool *pgxpool.Pool, conversationID, actor string) error {
+	var blocked bool
+	err := pool.QueryRow(ctx, `SELECT EXISTS (
+	 SELECT 1 FROM community_realm r WHERE r.type = 'community' AND
+	 (r.realm_id = $1 OR r.entity_id = $1 OR r.entity_id = $2 OR EXISTS (
+	   SELECT 1 FROM entity_connection c WHERE c.connection_id = $1
+	   AND (c.action_by_id = r.entity_id OR c.involved_entity_id = r.entity_id))))`, conversationID, actor).Scan(&blocked)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return ErrNoAccess
+	}
+	var conversation struct {
+		Type         string   `bson:"conversationType"`
+		Participants []string `bson:"participant_ids"`
+	}
+	err = db.Collection("conversations").FindOne(ctx, bson.M{"conversationID": conversationID}).Decode(&conversation)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if conversation.Type == "community" {
+		return ErrNoAccess
+	}
+	if len(conversation.Participants) == 0 {
+		return nil
+	}
+	err = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM community_realm
+	 WHERE type = 'community' AND entity_id = ANY($1))`, conversation.Participants).Scan(&blocked)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return ErrNoAccess
+	}
+	return nil
 }
 
 func queryReceivers(ctx context.Context, pool *pgxpool.Pool, sql string, arg any) ([]Receiver, error) {

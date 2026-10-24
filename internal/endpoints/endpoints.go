@@ -13,6 +13,7 @@
 package endpoints
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -129,14 +130,15 @@ func (h *Handlers) WhoAmI(w http.ResponseWriter, r *http.Request) {
 //
 // The caption comes back with the comments deliberately; see LoadPostThread.
 func (h *Handlers) PostComments(w http.ResponseWriter, r *http.Request) {
-	if _, ok := auth.FromContext(r.Context()); !ok {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
 		return
 	}
 	postID := r.PathValue("postID")
 	limit := readLimit(r, 50, 200)
 
-	thread, err := platform.LoadPostThread(r.Context(), h.Conns.Postgres, postID, limit)
+	thread, err := platform.LoadPostThreadForViewer(r.Context(), h.Conns.Postgres, postID, limit, token.EntityID)
 	if err != nil {
 		if errors.Is(err, platform.ErrPostNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]any{
@@ -158,6 +160,9 @@ func (h *Handlers) PostComments(w http.ResponseWriter, r *http.Request) {
 		"created_at":       thread.CreatedAt,
 		"count":            len(thread.Comments),
 		"comments":         thread.Comments,
+		"is_anonymous":     thread.IsAnonymous,
+		"is_owner":         thread.IsOwner,
+		"community":        thread.Community,
 	})
 }
 
@@ -210,14 +215,15 @@ func (h *Handlers) MessageModeration(w http.ResponseWriter, r *http.Request) {
 // needs to know what the post IS before it can say anything about it, and that
 // is the caption plus whatever was in the media.
 func (h *Handlers) PostModeration(w http.ResponseWriter, r *http.Request) {
-	if _, ok := auth.FromContext(r.Context()); !ok {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
 		return
 	}
 
 	postID := r.PathValue("postID")
-	records, err := platform.ModerationForPost(
-		r.Context(), h.Conns.Mongo, h.Conns.Postgres, postID)
+	records, err := platform.ModerationForPostForViewer(
+		r.Context(), h.Conns.Mongo, h.Conns.Postgres, postID, token.EntityID)
 	if err != nil {
 		if errors.Is(err, platform.ErrPostNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]any{
@@ -238,7 +244,8 @@ func (h *Handlers) PostModeration(w http.ResponseWriter, r *http.Request) {
 
 // CommentModeration returns what is known about the media on given comments.
 func (h *Handlers) CommentModeration(w http.ResponseWriter, r *http.Request) {
-	if _, ok := auth.FromContext(r.Context()); !ok {
+	token, ok := auth.FromContext(r.Context())
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"status": false})
 		return
 	}
@@ -251,8 +258,8 @@ func (h *Handlers) CommentModeration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := platform.ModerationForComments(
-		r.Context(), h.Conns.Mongo, h.Conns.Postgres, ids)
+	records, err := platform.ModerationForCommentsForViewer(
+		r.Context(), h.Conns.Mongo, h.Conns.Postgres, ids, token.EntityID)
 	if err != nil {
 		slog.Error("comment moderation read failed", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": false})
@@ -324,6 +331,9 @@ func (h *Handlers) Events(w http.ResponseWriter, r *http.Request) {
 	stream.Serve(r.Context(), w, h.Conns.Redis, token.EntityID, stream.Options{
 		Heartbeat:   h.Cfg.Heartbeat,
 		MaxLifetime: h.Cfg.MaxStreamLifetime,
+		AllowFrame: func(ctx context.Context, payload string) bool {
+			return platform.CommunityFrameAllowed(ctx, h.Conns.Postgres, token.EntityID, payload)
+		},
 	})
 }
 
@@ -704,8 +714,23 @@ type commentBody struct {
 	// The comment being replied to. Omit for a top-level comment. Named for
 	// what the caller MEANS - the comment they are answering - not for where
 	// the row ends up, which flattening may change.
-	ParentID string `json:"parentID"`
-	Text     string `json:"text"`
+	ParentID    string        `json:"parentID"`
+	Text        string        `json:"text"`
+	IsAnonymous strictBoolean `json:"is_anonymous"`
+}
+
+type strictBoolean bool
+
+func (b *strictBoolean) UnmarshalJSON(raw []byte) error {
+	switch string(raw) {
+	case "true":
+		*b = true
+	case "false":
+		*b = false
+	default:
+		return errors.New("is_anonymous must be a boolean")
+	}
+	return nil
 }
 
 // CreateComment posts a comment as the calling entity.
@@ -748,11 +773,15 @@ func (h *Handlers) CreateComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := platform.CreateComment(r.Context(), h.deps(), token.EntityID, platform.CommentRequest{
-		PostID:   body.PostID,
-		ParentID: body.ParentID,
-		Text:     body.Text,
+		PostID:      body.PostID,
+		ParentID:    body.ParentID,
+		Text:        body.Text,
+		IsAnonymous: bool(body.IsAnonymous),
 	})
 	switch {
+	case errors.Is(err, platform.ErrAnonymousOutsideCommunity):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": false, "message": err.Error()})
+		return
 	case errors.Is(err, platform.ErrEmptyComment):
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status": false, "message": "refusing to post an empty comment.",
@@ -785,6 +814,7 @@ func (h *Handlers) CreateComment(w http.ResponseWriter, r *http.Request) {
 		"parent_comment_id": result.ParentCommentID,
 		"replied_to":        result.RepliedTo,
 		"notified":          result.Notified,
+		"is_anonymous":      result.IsAnonymous,
 	})
 }
 

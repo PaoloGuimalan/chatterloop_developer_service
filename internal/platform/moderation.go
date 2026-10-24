@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -204,10 +203,14 @@ func ModerationForPost(
 	pool *pgxpool.Pool,
 	postID string,
 ) ([]ModerationRecord, error) {
+	return ModerationForPostForViewer(ctx, db, pool, postID, "")
+}
+
+func ModerationForPostForViewer(ctx context.Context, db *mongo.Database, pool *pgxpool.Pool, postID, viewer string) ([]ModerationRecord, error) {
 	if postID == "" {
 		return nil, ErrPostNotFound
 	}
-	if err := assertPostReadable(ctx, pool, postID); err != nil {
+	if err := assertPostReadableForViewer(ctx, pool, postID, viewer); err != nil {
 		return nil, err
 	}
 	return findModeration(ctx, db, []string{postID}, postSources)
@@ -223,33 +226,24 @@ func ModerationForComments(
 	pool *pgxpool.Pool,
 	commentIDs []string,
 ) ([]ModerationRecord, error) {
+	return ModerationForCommentsForViewer(ctx, db, pool, commentIDs, "")
+}
+
+func ModerationForCommentsForViewer(ctx context.Context, db *mongo.Database, pool *pgxpool.Pool, commentIDs []string, viewer string) ([]ModerationRecord, error) {
 	commentIDs = distinct(commentIDs)
 	if len(commentIDs) == 0 {
 		return []ModerationRecord{}, nil
 	}
 
-	rows, err := pool.Query(ctx, `
-		SELECT c.comment_id
-		  FROM newsfeed_comment c
-		  JOIN newsfeed_post p ON p.post_id = c.post_id
-		 WHERE c.comment_id = ANY($1)
-		   AND c.deleted_at IS NULL
-		   AND p.deleted_at IS NULL`, commentIDs)
+	comments, err := commentRowsForViewer(ctx, pool, commentIDs, viewer)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	allowed := make([]string, 0, len(commentIDs))
-	for rows.Next() {
-		var commentID string
-		if err := rows.Scan(&commentID); err != nil {
-			return nil, err
+	for _, id := range commentIDs {
+		if _, ok := comments[id]; ok {
+			allowed = append(allowed, id)
 		}
-		allowed = append(allowed, commentID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 
 	if len(allowed) == 0 {
@@ -260,16 +254,18 @@ func ModerationForComments(
 
 // assertPostReadable mirrors the existence test LoadPostThread makes.
 func assertPostReadable(ctx context.Context, pool *pgxpool.Pool, postID string) error {
-	var exists bool
-	err := pool.QueryRow(ctx, `
-		SELECT true
-		  FROM newsfeed_post
-		 WHERE post_id = $1 AND deleted_at IS NULL`, postID,
-	).Scan(&exists)
-	if errors.Is(err, pgx.ErrNoRows) {
+	return assertPostReadableForViewer(ctx, pool, postID, "")
+}
+
+func assertPostReadableForViewer(ctx context.Context, pool *pgxpool.Pool, postID, viewer string) error {
+	access, err := loadPostAccess(ctx, pool, postID, viewer)
+	if err != nil {
+		return err
+	}
+	if !access.permits(viewer, false) {
 		return ErrPostNotFound
 	}
-	return err
+	return nil
 }
 
 // conversationsOf maps each message id to the conversation holding it.

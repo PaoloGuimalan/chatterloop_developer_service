@@ -20,6 +20,7 @@ type PostComment struct {
 	AuthorHandle    string `json:"author_handle"`
 	Text            string `json:"text"`
 	CreatedAt       int64  `json:"created_at"`
+	IsAnonymous     bool   `json:"is_anonymous"`
 }
 
 // PostThread is a post and its comments - everything readable about the
@@ -31,6 +32,9 @@ type PostThread struct {
 	Caption        string        `json:"caption"`
 	CreatedAt      int64         `json:"created_at"`
 	Comments       []PostComment `json:"comments"`
+	IsAnonymous    bool          `json:"is_anonymous"`
+	IsOwner        bool          `json:"is_owner"`
+	Community      *Community    `json:"community,omitempty"`
 }
 
 // LoadPostThread returns a post and the newest `limit` comments on it, OLDEST
@@ -72,20 +76,40 @@ func LoadPostThread(
 	postID string,
 	limit int64,
 ) (*PostThread, error) {
+	return LoadPostThreadForViewer(ctx, pool, postID, limit, "")
+}
+
+// LoadPostThreadForViewer applies the live post audience, including membership
+// for private communities. The old wrapper cannot read community posts.
+func LoadPostThreadForViewer(ctx context.Context, pool *pgxpool.Pool, postID string, limit int64, viewer string) (*PostThread, error) {
 	if postID == "" {
 		return nil, ErrPostNotFound
+	}
+	access, err := loadPostAccess(ctx, pool, postID, viewer)
+	if err != nil {
+		return nil, err
+	}
+	if !access.permits(viewer, false) {
+		return nil, ErrPostNotFound
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
 	}
 
 	var (
 		authorEntityID string
 		caption        string
 		datePosted     time.Time
+		isAnonymous    bool
 	)
-	err := pool.QueryRow(ctx, `
-		SELECT entity_id, COALESCE(caption, ''), date_posted
+	err = pool.QueryRow(ctx, `
+		SELECT entity_id, COALESCE(caption, ''), date_posted, is_anonymous
 		  FROM newsfeed_post
 		 WHERE post_id = $1 AND deleted_at IS NULL`, postID,
-	).Scan(&authorEntityID, &caption, &datePosted)
+	).Scan(&authorEntityID, &caption, &datePosted, &isAnonymous)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return nil, ErrPostNotFound
@@ -99,6 +123,9 @@ func LoadPostThread(
 		Caption:        caption,
 		CreatedAt:      datePosted.UnixMilli(),
 		Comments:       []PostComment{},
+		IsAnonymous:    isAnonymous,
+		IsOwner:        authorEntityID == viewer,
+		Community:      access.Community,
 	}
 
 	// Newest first so the limit takes the LATEST window, reversed below - the
@@ -106,7 +133,7 @@ func LoadPostThread(
 	// does not have to remember which way each one runs.
 	rows, err := pool.Query(ctx, `
 		SELECT comment_id, parent_comment_id, entity_id,
-		       COALESCE(text, ''), created_at
+		       COALESCE(text, ''), created_at, is_anonymous
 		  FROM newsfeed_comment
 		 WHERE post_id = $1 AND deleted_at IS NULL
 		 ORDER BY created_at DESC, comment_id DESC
@@ -124,14 +151,21 @@ func LoadPostThread(
 			createdAt time.Time
 		)
 		if err := rows.Scan(&comment.CommentID, &parent, &comment.AuthorEntityID,
-			&comment.Text, &createdAt); err != nil {
+			&comment.Text, &createdAt, &comment.IsAnonymous); err != nil {
 			return nil, err
 		}
 		if parent != nil {
 			comment.ParentCommentID = *parent
 		}
 		comment.CreatedAt = createdAt.UnixMilli()
+		if comment.IsAnonymous {
+			comment.AuthorEntityID = ""
+		}
 		collected = append(collected, comment)
+	}
+	if thread.IsAnonymous {
+		thread.AuthorEntityID = ""
+		authorEntityID = ""
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

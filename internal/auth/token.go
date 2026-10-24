@@ -206,7 +206,8 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 		       is_active, revoked_at, expires_at,
 		       rate_limit_int, rate_limit_type
 		  FROM entity_token
-		 WHERE prefix = $1`, prefix,
+		 WHERE prefix = $1 AND NOT EXISTS (SELECT 1 FROM community_realm r
+		 WHERE r.entity_id = entity_token.entity_id AND r.type = 'community')`, prefix,
 	).Scan(&id, &entityID, &realmID, &name, &tokenHash, &scopesRaw,
 		&isActive, &revokedAt, &expiresAt, &rateLimitInt, &rateLimitType)
 	if err != nil {

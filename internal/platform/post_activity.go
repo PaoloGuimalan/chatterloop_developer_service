@@ -280,7 +280,9 @@ func postActivityMessage(postID, eventType string, actor *postActor, fields map[
 	// Omitted rather than null-valued when there is no actor, matching _actor()
 	// returning None - a reader treats an absent entity as "the platform did
 	// this", which is not the same claim as an entity with no id.
-	if actor != nil {
+	if anonymous, _ := fields["is_anonymous"].(bool); anonymous {
+		body["entity"] = nil
+	} else if actor != nil {
 		body["entity"] = actor
 	}
 

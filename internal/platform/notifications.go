@@ -68,9 +68,11 @@ type NewNotification struct {
 	// The sentence a person reads, and also the body of the realtime frame.
 	Details string
 	// Where the client should go: the post, anchored at the comment.
-	TargetType   string
-	TargetID     string
-	TargetAnchor string
+	TargetType        string
+	TargetID          string
+	TargetAnchor      string
+	IsAnonymous       bool
+	CommunityEntityID string
 }
 
 // WriteNotification inserts one notification and publishes the realtime frame
@@ -81,6 +83,26 @@ type NewNotification struct {
 // notification that could not be delivered must not be reported as a comment
 // that was not created.
 func WriteNotification(ctx context.Context, deps Deps, notification NewNotification) bool {
+	// Resolve the stored scope at delivery, rather than trusting a producer's
+	// recipient/identity claims. Membership may have changed since creation.
+	if notification.TargetType == "post" {
+		access, err := loadPostAccess(ctx, deps.Postgres, notification.TargetID, notification.ToEntityID)
+		if err != nil || !access.permits(notification.ToEntityID, false) {
+			return false
+		}
+		if access.CommunityCount > 0 {
+			var anonymous bool
+			if err := deps.Postgres.QueryRow(ctx, `SELECT is_anonymous FROM newsfeed_comment
+			 WHERE comment_id = $1 AND post_id = $2 AND deleted_at IS NULL`, notification.ReferenceID, notification.TargetID).Scan(&anonymous); err != nil {
+				return false
+			}
+			var allowed bool
+			notification, allowed = communityNotification(notification, access, anonymous)
+			if !allowed {
+				return false
+			}
+		}
+	}
 	notificationID, err := uniqueNotificationID(ctx, deps.Mongo)
 	if err != nil {
 		slog.Error("could not mint a notification id", "error", err)
@@ -107,6 +129,10 @@ func WriteNotification(ctx context.Context, deps Deps, notification NewNotificat
 		// audience selector, which nothing here writes.
 		"isRead": false,
 	}
+	if notification.CommunityEntityID != "" {
+		document["is_anonymous"] = notification.IsAnonymous
+		document["community_entity_id"] = notification.CommunityEntityID
+	}
 	// Written only when there is one, matching add_notification: an empty
 	// embedded document is indistinguishable from "no target" to the reader,
 	// which treats absent as "infer from type".
@@ -129,10 +155,29 @@ func WriteNotification(ctx context.Context, deps Deps, notification NewNotificat
 	// platform's side - clients respond by refetching the store - so there is
 	// nothing here to enrich and nothing a consumer should try to parse out of
 	// it.
+	var result any = ""
+	if notification.CommunityEntityID != "" {
+		result = map[string]any{
+			"post_id": notification.TargetID, "community_entity_id": notification.CommunityEntityID, "is_anonymous": notification.IsAnonymous,
+		}
+	}
 	publishFrame(ctx, deps, notification.ToEntityID, "notifications", map[string]any{
-		"status": true, "auth": true, "message": notification.Details, "result": "",
+		"status": true, "auth": true, "message": notification.Details, "result": result,
 	})
 	return true
+}
+
+func communityNotification(notification NewNotification, access *postAccess, anonymous bool) (NewNotification, bool) {
+	if !access.permits(notification.ToEntityID, false) || !access.CommunityMember || access.Community == nil {
+		return NewNotification{}, false
+	}
+	notification.CommunityEntityID = access.Community.EntityID
+	notification.FromEntityID = access.Community.EntityID
+	notification.IsAnonymous = anonymous
+	if anonymous {
+		notification.Details = "Someone contributed anonymously in your community."
+	}
+	return notification, true
 }
 
 // pythonDateString renders a timestamp the way Django's add_notification does:

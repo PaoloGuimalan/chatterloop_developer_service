@@ -33,8 +33,9 @@ type CommentRequest struct {
 	// The comment being replied to, or empty for a top-level comment. This is
 	// what the author AIMED at; where the row is stored may differ - see the
 	// flattening note on CreateComment.
-	ParentID string
-	Text     string
+	ParentID    string
+	Text        string
+	IsAnonymous bool
 }
 
 type CommentResult struct {
@@ -47,7 +48,8 @@ type CommentResult struct {
 	RepliedTo       string `json:"replied_to"`
 	// Entities told about this comment: the person replied to or the post's
 	// author, plus anyone @mentioned.
-	Notified []string `json:"notified"`
+	Notified    []string `json:"notified"`
+	IsAnonymous bool     `json:"is_anonymous"`
 }
 
 // commentAuthorPreview is how much of the replied-to comment Django quotes back
@@ -115,8 +117,11 @@ func CreateComment(ctx context.Context, deps Deps, authorEntityID string, req Co
 		return nil, ErrEmptyComment
 	}
 
-	post, err := loadPost(ctx, deps, req.PostID)
+	post, err := loadPostForViewer(ctx, deps, req.PostID, authorEntityID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateCommentAnonymity(req.IsAnonymous, post.CommunityCount); err != nil {
 		return nil, err
 	}
 
@@ -136,14 +141,22 @@ func CreateComment(ctx context.Context, deps Deps, authorEntityID string, req Co
 	}
 	now := time.Now().UTC()
 
-	if _, err := deps.Postgres.Exec(ctx, `
+	tag, err := deps.Postgres.Exec(ctx, `
 		INSERT INTO newsfeed_comment
 		       (comment_id, parent_comment_id, post_id, text, attachment,
-		        entity_id, created_at, updated_at, deleted_by_id, deleted_at)
-		VALUES ($1, NULLIF($2, ''), $3, $4, NULL, $5, $6, NULL, NULL, NULL)`,
-		commentID, storedParentID, req.PostID, text, authorEntityID, now,
-	); err != nil {
+		        entity_id, created_at, updated_at, deleted_by_id, deleted_at, is_anonymous)
+		SELECT $1, NULLIF($2, ''), $3, $4, NULL, $5, $6, NULL, NULL, NULL, $7
+		WHERE NOT EXISTS (SELECT 1 FROM newsfeed_posttag t JOIN community_realm r
+		 ON r.entity_id = t.entity_id AND r.type = 'community' WHERE t.post_id = $3)
+		OR EXISTS (SELECT 1 FROM community_member m JOIN community_realm r ON r.id = m.realm_id
+		 WHERE r.realm_id = $8 AND r.is_active AND m.entity_id = $5)`,
+		commentID, storedParentID, req.PostID, text, authorEntityID, now, req.IsAnonymous, post.CommunityRealmPK,
+	)
+	if err != nil {
 		return nil, fmt.Errorf("comment insert: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, ErrPostNotFound
 	}
 
 	// Everything past this point is fan-out. The comment exists; a failure here
@@ -157,6 +170,7 @@ func CreateComment(ctx context.Context, deps Deps, authorEntityID string, req Co
 		ParentCommentID: storedParentID,
 		RepliedTo:       req.ParentID,
 		Notified:        notified,
+		IsAnonymous:     req.IsAnonymous,
 	}, nil
 }
 
@@ -178,8 +192,10 @@ func storedParentFor(repliedTo *parentComment) string {
 }
 
 type postRow struct {
-	PostID   string
-	EntityID string
+	PostID           string
+	EntityID         string
+	CommunityCount   int
+	CommunityRealmPK string
 }
 
 type parentComment struct {
@@ -191,24 +207,22 @@ type parentComment struct {
 }
 
 func loadPost(ctx context.Context, deps Deps, postID string) (*postRow, error) {
-	if postID == "" {
-		return nil, ErrPostNotFound
-	}
-	var entityID string
-	err := deps.Postgres.QueryRow(ctx, `
-		SELECT entity_id
-		  FROM newsfeed_post
-		 WHERE post_id = $1 AND deleted_at IS NULL`, postID).Scan(&entityID)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// Django's own view does NOT filter deleted_at here and would happily
-		// comment on a removed post. Refusing is a divergence that can only
-		// prevent nonsense, so it is one worth having.
-		return nil, ErrPostNotFound
-	case err != nil:
+	return loadPostForViewer(ctx, deps, postID, "")
+}
+
+func loadPostForViewer(ctx context.Context, deps Deps, postID, viewer string) (*postRow, error) {
+	access, err := loadPostAccess(ctx, deps.Postgres, postID, viewer)
+	if err != nil {
 		return nil, err
 	}
-	return &postRow{PostID: postID, EntityID: entityID}, nil
+	if !access.permits(viewer, true) {
+		return nil, ErrPostNotFound
+	}
+	post := &postRow{PostID: postID, EntityID: access.AuthorEntityID, CommunityCount: access.CommunityCount}
+	if access.Community != nil {
+		post.CommunityRealmPK = access.Community.RealmID
+	}
+	return post, nil
 }
 
 func loadParentComment(ctx context.Context, deps Deps, parentID, postID string) (*parentComment, error) {
@@ -266,8 +280,13 @@ func commentFanOut(
 	// same pure function that decided where the row went, so the two cannot
 	// disagree, and `parent_id` must name where the row LANDED rather than
 	// what the author aimed at - see commentActivityFields.
-	publishCommentCreated(ctx, deps, req.PostID, commentID,
-		storedParentFor(repliedTo), authorEntityID)
+	fields := commentActivityFields(commentID, storedParentFor(repliedTo))
+	fields["is_anonymous"] = req.IsAnonymous
+	var actor *postActor
+	if !req.IsAnonymous {
+		actor = resolveActor(ctx, deps, authorEntityID)
+	}
+	publishPostActivity(ctx, deps, req.PostID, activityComment, actor, fields)
 
 	deps.Queue.Publish(ctx, queue.UpdateRankingScore, queue.RankingPayload{
 		PostID: req.PostID, UpdateType: "comment", IsDecrease: false,
@@ -332,6 +351,11 @@ func commentFanOut(
 	notified = append(notified,
 		notifyCommentMentions(ctx, deps, authorEntityID, authorHandle,
 			commentID, req.PostID, text, notified)...)
+	// Recipient ids can identify anonymous post/comment owners. Delivery remains
+	// private; the contribution response never exposes community recipients.
+	if post.CommunityCount > 0 {
+		return []string{}
+	}
 	return notified
 }
 

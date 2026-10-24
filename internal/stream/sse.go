@@ -47,6 +47,7 @@ func ChannelFor(entityID string) string {
 type Options struct {
 	Heartbeat   time.Duration
 	MaxLifetime time.Duration
+	AllowFrame  func(context.Context, string) bool
 }
 
 // Serve streams `events_<entityID>` to the client until it disconnects, the
@@ -100,6 +101,9 @@ func Serve(ctx context.Context, w http.ResponseWriter, rdb *redis.Client, entity
 		case message, open := <-messages:
 			if !open {
 				return
+			}
+			if opts.AllowFrame != nil && !opts.AllowFrame(ctx, message.Payload) {
+				continue
 			}
 			name := frameEvent(message.Payload)
 			// The payload is forwarded verbatim. This service does not parse,
