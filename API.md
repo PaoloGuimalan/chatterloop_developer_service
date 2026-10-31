@@ -30,7 +30,7 @@ read from headers.
 A request is allowed only when **both** hold:
 
 1. the scope is listed on the token (`entity_token.scopes`), **and**
-2. the owning entity has an explicit `grant` row in `entity_entitypermission`
+2. the owning entity has an explicit `grant` row in `entity_permission`
    with `realm_id IS NULL` and no expiry in the past.
 
 Either half missing means `403`. A token can never do more than its entity, and
@@ -905,10 +905,11 @@ case where `entity_token.scopes` and the entity's grants disagree:
 
 ```sql
 SELECT t.prefix, t.name, t.is_active, t.expires_at, t.scopes,
-       p.permission, p.effect, p.expires_at AS grant_expires
+       pc.codename AS permission, p.effect, p.expires_at AS grant_expires
   FROM entity_token t
-  LEFT JOIN entity_entitypermission p
+  LEFT JOIN entity_permission p
          ON p.entity_id = t.entity_id AND p.realm_id IS NULL
+  LEFT JOIN entity_permission_catalog pc ON pc.id = p.permission_id
  WHERE t.prefix = '<prefix>';
 ```
 

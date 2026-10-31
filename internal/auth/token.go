@@ -24,7 +24,7 @@
 // entity-type defaults, then a platform default predicate. Porting all four
 // layers into a third language is exactly the drift risk worth avoiding, so
 // this service does not. It requires an EXPLICIT grant row in
-// entity_entitypermission for every permission it gates, and consults nothing
+// entity_permission for every permission it gates, and consults nothing
 // else.
 //
 // That is deliberately STRICTER than the platform, and one of those defaults
@@ -293,12 +293,15 @@ func Authorize(ctx context.Context, pool *pgxpool.Pool, token *Token, permission
 // row would not apply.
 func hasExplicitGrant(ctx context.Context, pool *pgxpool.Pool, entityID, permission string) (bool, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT effect
-		  FROM entity_entitypermission
-		 WHERE entity_id = $1
-		   AND permission = $2
-		   AND realm_id IS NULL
-		   AND (expires_at IS NULL OR expires_at > NOW())`,
+		SELECT ep.effect
+		  FROM entity_permission ep
+		  JOIN entity_permission_catalog pc ON pc.id = ep.permission_id
+		 WHERE ep.entity_id = $1
+		   AND pc.codename = $2
+		   AND pc.is_active = TRUE
+		   AND pc.scope = 'global'
+		   AND ep.realm_id IS NULL
+		   AND (ep.expires_at IS NULL OR ep.expires_at > NOW())`,
 		entityID, permission)
 	if err != nil {
 		return false, err

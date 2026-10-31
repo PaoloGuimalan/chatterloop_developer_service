@@ -57,7 +57,7 @@ move rather than a rewrite.
 A request is allowed only when **both** hold:
 
 1. the scope is on the token, and
-2. the owning entity has an **explicit grant** in `entity_entitypermission`.
+2. the owning entity has an **explicit grant** in `entity_permission`.
 
 The second half is deliberately stricter than the platform's own resolver,
 which would also honour role, entity-type and platform defaults. One of those
@@ -132,14 +132,15 @@ timer.
 issued but inert, because authorization is an intersection.
 
 ```sql
-INSERT INTO entity_entitypermission
-  (id, entity_id, permission, effect, realm_id, reason, created_by_id, created_at, expires_at)
-SELECT gen_random_uuid()::text, '<entity-id>', codename, 'grant', NULL,
+INSERT INTO entity_permission
+  (id, entity_id, permission_id, effect, realm_id, reason, created_by_id, created_at, expires_at)
+SELECT gen_random_uuid()::text, '<entity-id>', id, 'grant', NULL,
        'developer API access', NULL, NOW(), NULL
-  FROM unnest(ARRAY[
+  FROM entity_permission_catalog
+ WHERE is_active = TRUE AND scope = 'global' AND codename IN (
     'messages.read', 'notifications.read', 'messages.send', 'comments.create',
     'events.subscribe'
-  ]) AS codename;
+  );
 ```
 
 **4 — check it.**
