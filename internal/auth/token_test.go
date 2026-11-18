@@ -81,7 +81,7 @@ func TestHasScope(t *testing.T) {
 }
 
 // Authorize must refuse anything outside gatedPermissions rather than guess.
-// The set is small on purpose: every entry has to be a global-scoped codename,
+// The set is small on purpose: every entry has to be a global-scoped code,
 // because this service does not carry the role matrix needed to resolve a
 // realm-scoped one. Widening it without that context is how a deny silently
 // becomes an allow.

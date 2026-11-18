@@ -24,7 +24,7 @@ func decodeFrame(t *testing.T, body map[string]any) jwt.MapClaims {
 	claims := jwt.MapClaims{}
 	if _, err := jwt.ParseWithClaims(raw, claims, func(*jwt.Token) (any, error) {
 		return []byte(testSecret), nil
-	}); err != nil {
+	}, jwt.WithTimeFunc(func() time.Time { return signedAt })); err != nil {
 		t.Fatalf("frame did not verify against the shared secret: %v", err)
 	}
 	return claims

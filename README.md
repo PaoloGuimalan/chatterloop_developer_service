@@ -109,7 +109,7 @@ VALUES
    NULL, NULL, NOW(), NOW() + INTERVAL '90 days', NULL, NULL, true, NULL, NULL);
 ```
 
-`scopes` is a JSON array of catalog codenames. `expires_at` may be `NULL` for
+`scopes` is a JSON array of catalog codes. `expires_at` may be `NULL` for
 no expiry — a service credential that never expires should be a decision, not
 a default.
 
@@ -137,7 +137,7 @@ INSERT INTO entity_permission
 SELECT gen_random_uuid()::text, '<entity-id>', id, 'grant', NULL,
        'developer API access', NULL, NOW(), NULL
   FROM entity_permission_catalog
- WHERE is_active = TRUE AND scope = 'global' AND codename IN (
+ WHERE is_active = TRUE AND scope = 'global' AND code IN (
     'messages.read', 'notifications.read', 'messages.send', 'comments.create',
     'events.subscribe'
   );

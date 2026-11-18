@@ -37,7 +37,7 @@ Either half missing means `403`. A token can never do more than its entity, and
 revoking the entity's grant narrows every token it owns with no token edit.
 
 > **Both halves are easy to get half-right.** A token whose `scopes` array is
-> missing a codename fails even though the entity grants it, and the error
+> missing a code fails even though the entity grants it, and the error
 > looks identical to the reverse. `GET /v1/whoami` shows the token half only —
 > see *Verifying a credential* at the end.
 
@@ -421,7 +421,7 @@ otherwise be a way around a block: find the handle here, address it there.
 The caller is never in its own results. An agent searching for somebody to talk
 to does not mean itself.
 
-Gated on `messages.read`. None of the five codenames in the platform's catalog
+Gated on `messages.read`. None of the five codes in the platform's catalog
 describes a directory, and a scope invented here would match no grant and
 refuse everybody — Django owns that table. Worth revisiting as
 `entities.search` the next time `user_service/entity/permissions.py` is touched.
@@ -905,7 +905,7 @@ case where `entity_token.scopes` and the entity's grants disagree:
 
 ```sql
 SELECT t.prefix, t.name, t.is_active, t.expires_at, t.scopes,
-       pc.codename AS permission, p.effect, p.expires_at AS grant_expires
+       pc.code AS permission, p.effect, p.expires_at AS grant_expires
   FROM entity_token t
   LEFT JOIN entity_permission p
          ON p.entity_id = t.entity_id AND p.realm_id IS NULL
@@ -913,7 +913,7 @@ SELECT t.prefix, t.name, t.is_active, t.expires_at, t.scopes,
  WHERE t.prefix = '<prefix>';
 ```
 
-Every codename in `t.scopes` needs a matching row with `effect = 'grant'` and
+Every code in `t.scopes` needs a matching row with `effect = 'grant'` and
 no expiry in the past. A scope present on the token but not granted to the
 entity yields `403`; the reverse is silent, because the token simply never
 asks.

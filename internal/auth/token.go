@@ -77,7 +77,7 @@ const (
 	PermissionCommentsCreate    = "comments.create"
 )
 
-// Every entry must be a GLOBAL-scoped codename in the platform catalog. A
+// Every entry must be a GLOBAL-scoped code in the platform catalog. A
 // realm-scoped one would need the role matrix to resolve, which this service
 // deliberately does not carry.
 var gatedPermissions = map[string]bool{
@@ -138,11 +138,11 @@ type Token struct {
 	RateLimitType *string
 }
 
-// HasScope reports whether the token carries a codename. Half an authorization
+// HasScope reports whether the token carries a code. Half an authorization
 // decision - see Authorize.
-func (t *Token) HasScope(codename string) bool {
+func (t *Token) HasScope(code string) bool {
 	for _, scope := range t.Scopes {
-		if scope == codename {
+		if scope == code {
 			return true
 		}
 	}
@@ -297,7 +297,7 @@ func hasExplicitGrant(ctx context.Context, pool *pgxpool.Pool, entityID, permiss
 		  FROM entity_permission ep
 		  JOIN entity_permission_catalog pc ON pc.id = ep.permission_id
 		 WHERE ep.entity_id = $1
-		   AND pc.codename = $2
+		   AND pc.code = $2
 		   AND pc.is_active = TRUE
 		   AND pc.scope = 'global'
 		   AND ep.realm_id IS NULL
