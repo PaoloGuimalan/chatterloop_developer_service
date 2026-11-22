@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"developer_service/internal/realmaccess"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -38,28 +39,40 @@ func AssertMember(
 	pool *pgxpool.Pool,
 	conversationID, entityID string,
 ) error {
-	if err := assertMessagingCapability(ctx, db, pool, conversationID, entityID); err != nil {
-		return err
-	}
+	_, err := assertMemberScope(ctx, db, pool, conversationID, entityID)
+	return err
+}
+
+func assertMemberScope(ctx context.Context, db *mongo.Database, pool *pgxpool.Pool, conversationID, entityID string) (bool, error) {
 	var (
 		realmEntityID *string
 		realmType     string
 		isPrivate     bool
+		active        bool
 	)
 	err := pool.QueryRow(ctx, `
-		SELECT entity_id, type, is_private
-		  FROM community_realm
+		SELECT entity_id, type, is_private, `+realmaccess.ActiveSQL("r")+`
+		  FROM community_realm r
 		 WHERE realm_id = $1`, conversationID,
-	).Scan(&realmEntityID, &realmType, &isPrivate)
+	).Scan(&realmEntityID, &realmType, &isPrivate, &active)
+	if err == nil && !active {
+		return true, ErrNoAccess
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if capabilityErr := assertMessagingCapability(ctx, db, pool, conversationID, entityID); capabilityErr != nil {
+		return err == nil, capabilityErr
+	}
 
 	switch {
 	case err == nil:
-		return assertRealmMember(ctx, pool, conversationID, entityID,
+		return true, assertRealmMember(ctx, pool, conversationID, entityID,
 			realmEntityID, realmType, isPrivate)
 	case errors.Is(err, pgx.ErrNoRows):
-		return assertDirectMember(ctx, db, pool, conversationID, entityID)
+		return false, assertDirectMember(ctx, db, pool, conversationID, entityID)
 	default:
-		return err
+		return false, err
 	}
 }
 
@@ -122,6 +135,7 @@ func assertDirectMember(
 	count, err := db.Collection("conversations").CountDocuments(ctx, bson.M{
 		"conversationID":  conversationID,
 		"participant_ids": entityID,
+		"$or":             bson.A{bson.M{"conversationType": "single"}, bson.M{"conversationType": bson.M{"$exists": false}}},
 	})
 	if err != nil {
 		return err
@@ -217,7 +231,7 @@ func Receivers(
 func assertMessagingCapability(ctx context.Context, db *mongo.Database, pool *pgxpool.Pool, conversationID, actor string) error {
 	var blocked bool
 	err := pool.QueryRow(ctx, `SELECT EXISTS (
-	 SELECT 1 FROM community_realm r WHERE r.type = 'community' AND
+	 SELECT 1 FROM community_realm r WHERE (r.type = 'community' OR NOT `+realmaccess.ActiveSQL("r")+`) AND
 	 (r.realm_id = $1 OR r.entity_id = $1 OR r.entity_id = $2 OR EXISTS (
 	   SELECT 1 FROM entity_connection c WHERE c.connection_id = $1
 	   AND (c.action_by_id = r.entity_id OR c.involved_entity_id = r.entity_id))))`, conversationID, actor).Scan(&blocked)
@@ -244,8 +258,8 @@ func assertMessagingCapability(ctx context.Context, db *mongo.Database, pool *pg
 	if len(conversation.Participants) == 0 {
 		return nil
 	}
-	err = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM community_realm
-	 WHERE type = 'community' AND entity_id = ANY($1))`, conversation.Participants).Scan(&blocked)
+	err = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM community_realm r
+	 WHERE (type = 'community' OR NOT `+realmaccess.ActiveSQL("r")+`) AND entity_id = ANY($1))`, conversation.Participants).Scan(&blocked)
 	if err != nil {
 		return err
 	}

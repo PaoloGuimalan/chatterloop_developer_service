@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"developer_service/internal/queue"
+	"developer_service/internal/realmaccess"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -140,8 +142,27 @@ func CreateComment(ctx context.Context, deps Deps, authorEntityID string, req Co
 		return nil, err
 	}
 	now := time.Now().UTC()
-
-	tag, err := deps.Postgres.Exec(ctx, `
+	var required []string
+	if post.CommunityRealmPK != "" {
+		required = []string{post.CommunityRealmPK}
+	}
+	tx, err := realmaccess.LockWrite(ctx, deps.Postgres, required, []string{authorEntityID, post.EntityID})
+	if err != nil {
+		if errors.Is(err, realmaccess.ErrUnavailable) {
+			return nil, ErrPostNotFound
+		}
+		return nil, err
+	}
+	if tx != nil {
+		defer tx.Rollback(ctx)
+	}
+	var writer interface {
+		Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	} = deps.Postgres
+	if tx != nil {
+		writer = tx
+	}
+	tag, err := writer.Exec(ctx, `
 		INSERT INTO newsfeed_comment
 		       (comment_id, parent_comment_id, post_id, text, attachment,
 		        entity_id, created_at, updated_at, deleted_by_id, deleted_at, is_anonymous)
@@ -157,6 +178,11 @@ func CreateComment(ctx context.Context, deps Deps, authorEntityID string, req Co
 	}
 	if tag.RowsAffected() != 1 {
 		return nil, ErrPostNotFound
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// Everything past this point is fan-out. The comment exists; a failure here
@@ -289,7 +315,7 @@ func commentFanOut(
 	publishPostActivity(ctx, deps, req.PostID, activityComment, actor, fields)
 
 	deps.Queue.Publish(ctx, queue.UpdateRankingScore, queue.RankingPayload{
-		PostID: req.PostID, UpdateType: "comment", IsDecrease: false,
+		PostID: req.PostID, UpdateType: "comment", IsDecrease: false, SourceActivityID: commentID,
 	})
 
 	// The post's interests as they stood BEFORE this comment, matching the

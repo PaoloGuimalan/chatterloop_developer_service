@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"developer_service/internal/realmaccess"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -135,8 +136,8 @@ func SearchEntities(
 			 UNION ALL
 			SELECT entity_id, 'realm'::text,
 			       coalesce(slug,''), coalesce(name,''), coalesce(profile,'')
-			  FROM community_realm
-			 WHERE is_active
+			  FROM community_realm r
+			 WHERE `+realmaccess.ActiveSQL("r")+`
 			   AND (lower(coalesce(slug,'')) LIKE $2 OR lower(coalesce(name,'')) LIKE $2)
 			 UNION ALL
 			SELECT entity_id, 'bot'::text,

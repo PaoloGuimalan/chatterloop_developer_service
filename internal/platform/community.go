@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"developer_service/internal/realmaccess"
 	"encoding/json"
 	"errors"
 
@@ -19,16 +20,20 @@ type Community struct {
 
 // postAccess is resolved from storage, never from client audience claims.
 type postAccess struct {
-	AuthorEntityID   string
-	OrdinaryReadable bool
-	CommunityCount   int
-	CommunityActive  bool
-	CommunityPrivate bool
-	CommunityMember  bool
-	Community        *Community
+	AuthorEntityID    string
+	OrdinaryReadable  bool
+	CommunityCount    int
+	CommunityActive   bool
+	CommunityPrivate  bool
+	CommunityMember   bool
+	Community         *Community
+	AuthorUnavailable bool
 }
 
 func (p postAccess) permits(viewer string, write bool) bool {
+	if p.AuthorUnavailable {
+		return false
+	}
 	if p.CommunityCount == 0 {
 		return p.OrdinaryReadable
 	}
@@ -47,7 +52,7 @@ func loadPostAccess(ctx context.Context, db postQuerier, postID, viewer string) 
 	var p postAccess
 	var realmID, entityID string
 	err := db.QueryRow(ctx, `
-		SELECT p.entity_id,
+		SELECT p.entity_id, NOT (`+realmaccess.EntityAvailableSQL("p.entity_id")+`),
 		       COALESCE((COALESCE(p.privacy_status, 'public') = 'public' OR p.entity_id = NULLIF($2, '')
 		        OR (p.privacy_status = 'connections' AND EXISTS (
 		          SELECT 1 FROM entity_connection c
@@ -60,14 +65,14 @@ func loadPostAccess(ctx context.Context, db postQuerier, postID, viewer string) 
 		       COALESCE(scope.member, false), COALESCE(scope.realm_id, ''), COALESCE(scope.entity_id, '')
 		FROM newsfeed_post p
 		CROSS JOIN LATERAL (
-		  SELECT COUNT(DISTINCT r.realm_id)::int AS total, bool_and(r.is_active) AS active,
+		  SELECT COUNT(DISTINCT r.realm_id)::int AS total, bool_and(`+realmaccess.ActiveSQL("r")+`) AS active,
 		         bool_or(r.is_private) AS private, MIN(r.realm_id) AS realm_id, MIN(r.entity_id) AS entity_id,
 		         bool_and(EXISTS (SELECT 1 FROM community_member m WHERE m.realm_id = r.id AND m.entity_id = $2)) AS member
 		  FROM newsfeed_posttag t JOIN community_realm r ON r.entity_id = t.entity_id AND r.type = 'community'
 		  WHERE t.post_id = p.post_id
 		) scope
 		WHERE p.post_id = $1 AND p.deleted_at IS NULL`, postID, viewer).Scan(
-		&p.AuthorEntityID, &p.OrdinaryReadable, &p.CommunityCount, &p.CommunityActive,
+		&p.AuthorEntityID, &p.AuthorUnavailable, &p.OrdinaryReadable, &p.CommunityCount, &p.CommunityActive,
 		&p.CommunityPrivate, &p.CommunityMember, &realmID, &entityID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrPostNotFound

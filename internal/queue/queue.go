@@ -67,9 +67,10 @@ type ChatScorePayload struct {
 // owns comments_count the same way it owns likes_count, so a comment written
 // here must publish this or the count never moves.
 type RankingPayload struct {
-	PostID     string `json:"post_id"`
-	UpdateType string `json:"update_type"`
-	IsDecrease bool   `json:"is_decrease"`
+	PostID           string `json:"post_id"`
+	UpdateType       string `json:"update_type"`
+	IsDecrease       bool   `json:"is_decrease"`
+	SourceActivityID string `json:"source_activity_id,omitempty"`
 }
 
 // InterestAffinityPayload mirrors worker_service's BumpInterestAffinityPayload.

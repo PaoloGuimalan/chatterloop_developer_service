@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"developer_service/internal/queue"
+	"developer_service/internal/realmaccess"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -89,7 +90,8 @@ func SendMessage(ctx context.Context, deps Deps, senderEntityID string, req Send
 
 	// Access first: everything below writes, and the caller has no business
 	// learning that a conversation exists by watching which error it gets.
-	if err := AssertMember(ctx, deps.Mongo, deps.Postgres, req.ConversationID, senderEntityID); err != nil {
+	isRealm, err := assertMemberScope(ctx, deps.Mongo, deps.Postgres, req.ConversationID, senderEntityID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -165,8 +167,39 @@ func SendMessage(ctx context.Context, deps Deps, senderEntityID string, req Send
 		"messageType":      messageType,
 		"conversationType": conversationType,
 	}
+	var required []string
+	if isRealm {
+		required = []string{req.ConversationID}
+	}
+	tx, err := realmaccess.LockWrite(ctx, deps.Postgres, required, []string{senderEntityID})
+	if err != nil {
+		if errors.Is(err, realmaccess.ErrUnavailable) {
+			return nil, ErrNoAccess
+		}
+		return nil, err
+	}
+	if tx != nil {
+		defer tx.Rollback(ctx)
+	}
 	if _, err := deps.Mongo.Collection("messages").InsertOne(ctx, document); err != nil {
 		return nil, fmt.Errorf("message insert: %w", err)
+	}
+	// Persist the header under the same realm locks as the message. Fan-out
+	// after releasing them must never upsert a deleted conversation.
+	entityIDs := make([]string, 0, len(receivers))
+	for _, receiver := range receivers {
+		entityIDs = append(entityIDs, receiver.EntityID)
+	}
+	if _, err := deps.Mongo.Collection("chat_history").UpdateMany(ctx, bson.M{"conversationID": req.ConversationID}, bson.M{"$set": bson.M{"isArchived": false}}); err != nil {
+		slog.Error("un-archive failed", "error", err)
+	}
+	if err := saveConversation(ctx, deps.Mongo, req.ConversationID, conversationType, entityIDs, messageID, senderEntityID, content, messageType, now); err != nil {
+		slog.Error("conversation preview update failed", "error", err)
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// Everything past this point is fan-out. The message exists; a failure
@@ -195,23 +228,6 @@ func fanOut(
 	entityIDs := make([]string, 0, len(receivers))
 	for _, receiver := range receivers {
 		entityIDs = append(entityIDs, receiver.EntityID)
-	}
-
-	// (1) A message un-archives the conversation for everyone in it: an
-	// archived thread that receives a reply should reappear.
-	if _, err := deps.Mongo.Collection("chat_history").UpdateMany(ctx,
-		bson.M{"conversationID": req.ConversationID},
-		bson.M{"$set": bson.M{"isArchived": false}},
-	); err != nil {
-		slog.Error("un-archive failed", "conversation_id", req.ConversationID, "error", err)
-	}
-
-	// (2) The conversation list renders from this, so skipping it leaves the
-	// thread showing its previous message as the latest.
-	if err := saveConversation(ctx, deps.Mongo, req.ConversationID, conversationType,
-		entityIDs, messageID, senderEntityID, content, messageType, now); err != nil {
-		slog.Error("conversation preview update failed",
-			"conversation_id", req.ConversationID, "error", err)
 	}
 
 	// (3) One frame per recipient, in the platform's envelope.

@@ -332,6 +332,10 @@ func (h *Handlers) Events(w http.ResponseWriter, r *http.Request) {
 		Heartbeat:   h.Cfg.Heartbeat,
 		MaxLifetime: h.Cfg.MaxStreamLifetime,
 		AllowFrame: func(ctx context.Context, payload string) bool {
+			allowed, err := auth.Authorize(ctx, h.Conns.Postgres, token, auth.PermissionEventsSubscribe)
+			if err != nil || !allowed {
+				return false
+			}
 			return platform.CommunityFrameAllowed(ctx, h.Conns.Postgres, token.EntityID, payload)
 		},
 	})

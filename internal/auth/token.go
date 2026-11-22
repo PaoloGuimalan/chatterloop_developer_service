@@ -49,6 +49,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"developer_service/internal/realmaccess"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -207,7 +208,9 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, raw string) (*Token, error)
 		       rate_limit_int, rate_limit_type
 		  FROM entity_token
 		 WHERE prefix = $1 AND NOT EXISTS (SELECT 1 FROM community_realm r
-		 WHERE r.entity_id = entity_token.entity_id AND r.type = 'community')`, prefix,
+		 WHERE r.entity_id = entity_token.entity_id AND r.type = 'community')
+		 AND `+realmaccess.EntityAvailableSQL("entity_token.entity_id")+`
+		 AND (realm_id IS NULL OR EXISTS(SELECT 1 FROM community_realm target WHERE target.id=entity_token.realm_id AND `+realmaccess.ActiveSQL("target")+`))`, prefix,
 	).Scan(&id, &entityID, &realmID, &name, &tokenHash, &scopesRaw,
 		&isActive, &revokedAt, &expiresAt, &rateLimitInt, &rateLimitType)
 	if err != nil {
@@ -283,6 +286,15 @@ func Authorize(ctx context.Context, pool *pgxpool.Pool, token *Token, permission
 	if token == nil || !token.HasScope(permission) {
 		return false, nil
 	}
+	if token.RealmID != nil {
+		state, err := realmaccess.Check(ctx, pool, *token.RealmID)
+		if err != nil {
+			return false, err
+		}
+		if !state.Active {
+			return false, nil
+		}
+	}
 	return hasExplicitGrant(ctx, pool, token.EntityID, permission)
 }
 
@@ -301,7 +313,8 @@ func hasExplicitGrant(ctx context.Context, pool *pgxpool.Pool, entityID, permiss
 		   AND pc.is_active = TRUE
 		   AND pc.scope = 'global'
 		   AND ep.realm_id IS NULL
-		   AND (ep.expires_at IS NULL OR ep.expires_at > NOW())`,
+		   AND (ep.expires_at IS NULL OR ep.expires_at > NOW())
+		   AND `+realmaccess.EntityAvailableSQL("ep.entity_id"),
 		entityID, permission)
 	if err != nil {
 		return false, err
